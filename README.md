@@ -545,9 +545,30 @@ Two guards keep the calls safe, and both are reported, never silent:
 * At most 12 handlers per plugin, 1.5 s each, so a hanging handler becomes a "did not finish" lead rather
   than a stuck probe.
 
+Everything under `=== Probe notes ===` is context, never a verdict, and each note is printed with its kind
+so the sentence does not have to be decoded:
+
+* `skipped by design` — the probe did not call the route (a mutating path, or the handler budget was
+  reached). Nothing is known about it either way: neither a pass nor a failure.
+* `stub may be the cause` — a `ctx.effect`/`ctx.inject` registration callback threw while the probe ran
+  it, or a service lookup entered a branch the real host may skip. The message carries the explicit
+  reminder that the recording stub is a plausible cause. The class of message the stub can produce is
+  broad and includes Node's own argument validation tripped by a proxy — `The "path" argument must be of
+  type string. Received function undefined` is a stub reaching `path.isAbsolute`, not a plugin bug.
+* `probe error` — the probe could not run one registered handler. It says nothing about the plugin.
+
+The stub is forgiving about **names** as well as values: `ctx.get(name)` answers with a stub for any name,
+so a plugin that guards a block with such a lookup runs that block even where nothing provides the
+service. The lookups are recorded (`lookups` in `--json`), and when one of them explains a callback
+failure the report says so — naming the service, and stating that no probed plugin provides it and the
+installed core never spells it either, so a real host resolves it to `undefined` and never enters that
+branch. That is the shape of a failure that exists only inside the probe.
+
 `verify --no-handlers` skips the calls entirely. That is a strictly weaker answer, so it is **not
 cached**: a cache must never lose evidence a later reader would trust. `--json` carries the calls as
-`handlers` (`path`, `error`, `logs`, `status`, `body`, `timedOut`, `ms`) and the skips as `notes`.
+`handlers` (`path`, `error`, `logs`, `status`, `body`, `timedOut`, `ms`), the named lookups as `lookups`
+and the notes as `notes` — the raw sentences, with `note_family()`/`note_line()` rendering them for a
+reader.
 
 Honest scope: this is not a real request. The handler sees `GET`, no body, no authentication and stub
 services, so "the first call did not throw" is not proof that the handler works — only "it threw a

@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import effects as effects_mod
-from .paths import read_json, state_dir
+from .paths import core_install_dir, host_modules_dir, read_json, state_dir
 
 #: The whole result is one machine-readable line on stdout, prefixed with this.
 PROBE_MARKER = "__DSH_PROBE__"
@@ -61,7 +61,7 @@ PROBE_TIMEOUT = 90
 #: answer a weaker question. The route-handler calls are part of the current
 #: schema: a verdict without them says "the handler was registered", never "the
 #: handler runs".
-PROBE_SCHEMA = 3
+PROBE_SCHEMA = 4
 
 #: Statuses.
 LOADS = "loads"          # the server entry imported
@@ -114,7 +114,10 @@ LEGEND = {
 #: a simulation of the deployment: a service the plugin needs but the deployment
 #: lacks cannot be seen from here (the plugin simply gets a stub). Module-level
 #: ``ctx.effect(cb)`` callbacks ARE invoked, since that is where many plugins do
-#: their registration; event handlers (``ctx.on``) are not.
+#: their registration; event handlers (``ctx.on``) are not. ``ctx.get(name)`` also
+#: answers with a stub, and the lookup is recorded: a plugin that branches on it
+#: takes the "service is present" branch here, which a deployment providing no such
+#: service would not take, so the report has to be able to say so.
 #:
 #: Calling handlers has one guard: a route whose path names a mutation (delete,
 #: save, reset, …) is recorded but not called, because the probe only ever sends a
@@ -129,6 +132,7 @@ const emit = (payload) => process.stdout.write("\\n" + "__DSH_PROBE__"
 const routes = [];
 const calls = [];
 const notes = [];
+const gets = [];
 const handlerQueue = [];
 const handlers = [];
 const seenHandlerPaths = new Set();
@@ -381,6 +385,22 @@ const ctx = new Proxy(context, {
       };
       return context[key];
     }
+    if (key === "get") {
+      //: Cordis resolves a service by name and answers ``undefined`` when nothing
+      //: provides it. The recording context cannot afford that (see
+      //: ``serviceProxy``): a plugin guarding a block with ``if (ctx.get("x"))``
+      //: would take the other branch here than in production. The name is
+      //: recorded instead, so the report can point at the branch that ran rather
+      //: than leave the reader with a bare error thrown from inside it.
+      context[key] = (service) => {
+        const serviceName = String(service);
+        gets.push(serviceName);
+        calls.push("ctx.get(" + serviceName + ")");
+        if (serviceName in context) return context[serviceName];
+        return serviceProxy(serviceName);
+      };
+      return context[key];
+    }
     context[key] = serviceProxy(key);
     return context[key];
   }
@@ -427,6 +447,7 @@ try {
     routes,
     handlers,
     calls: [...new Set(calls)].sort().slice(0, 24),
+    gets: [...new Set(gets)].sort().slice(0, 32),
     notes
   });
 } catch (error) {
@@ -456,6 +477,10 @@ class Probe:
     injects: list[str] = field(default_factory=list)
     #: Services and methods ``apply()`` actually reached for.
     calls: list[str] = field(default_factory=list)
+    #: Service names looked up with ``ctx.get(name)``. The recording context
+    #: answers every name, so the report needs these to say which lookup entered
+    #: the "service is present" branch a real host may never take.
+    lookups: list[str] = field(default_factory=list)
     apply_error: str | None = None
     #: HTTP status per registered path, filled in by the live probe.
     live: dict[str, int] = field(default_factory=dict)
@@ -465,7 +490,9 @@ class Probe:
     handlers: list[dict] = field(default_factory=list)
     #: Anything the probe wanted to say without calling it a failure: an
     #: ``effect``/``inject`` callback that threw, a handler it deliberately did
-    #: not call, a route it skipped.
+    #: not call, a route it skipped, a service lookup no deployment provides.
+    #: Raw and stable; :func:`note_family` classifies each entry and
+    #: :func:`note_line` renders it for a reader.
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -489,6 +516,7 @@ class Probe:
             "applied": self.applied,
             "injects": self.injects,
             "calls": self.calls,
+            "lookups": self.lookups,
             "apply_error": self.apply_error,
             "live": self.live,
             "handlers": self.handlers,
@@ -581,6 +609,7 @@ def probe_one(name: str, profile_dir: Path, *, node: str | None = None,
             applied=bool(payload.get("applied")),
             injects=[str(item) for item in payload.get("inject") or []],
             calls=[str(item) for item in payload.get("calls") or []],
+            lookups=[str(item) for item in payload.get("gets") or []],
             apply_error=payload.get("apply_error"),
             handlers=[record for record in payload.get("handlers") or []
                       if isinstance(record, dict)],
@@ -651,11 +680,88 @@ def merge_probe(existing: Probe | None, new: Probe) -> Probe:
         applied=existing.applied or new.applied,
         injects=sorted(set(existing.injects) | set(new.injects)),
         calls=sorted(set(existing.calls) | set(new.calls)),
+        lookups=sorted(set(existing.lookups) | set(new.lookups)),
         apply_error=existing.apply_error or new.apply_error,
         live={**new.live, **existing.live},
         handlers=handlers,
         notes=sorted(set(existing.notes) | set(new.notes)),
     )
+
+
+#: ``ctx.provide(name)`` exactly as the recording context writes it into ``calls``.
+_PROVIDE_RE = re.compile(r"^ctx\.provide\(([^)]+)\)$")
+
+
+def provided_services(results: dict[str, Probe]) -> set[str]:
+    """Every service name the probed plugins registered for themselves."""
+    provided: set[str] = set()
+    for probe in results.values():
+        for call in probe.calls:
+            match = _PROVIDE_RE.match(str(call))
+            if match:
+                provided.add(match.group(1))
+    return provided
+
+
+def core_service_names(names: set[str], install: Path | None = None) -> set[str]:
+    """Which of ``names`` the installed core spells anywhere in its own bytes.
+
+    Cordis registers a service under its literal name, so a name the core never
+    spells cannot be a core service. This is only used to keep an absent-service
+    note honest, and it errs towards silence: a name found here is left alone, and
+    a core that cannot be located yields every name (nothing claimed). The scan
+    reads the core's generated declarations and code once per probe run, and only
+    when there is a name to look up.
+    """
+    if not names:
+        return set()
+    modules = host_modules_dir(core_install_dir() if install is None else install)
+    if modules is None:
+        return set(names)
+    found: set[str] = set()
+    for pattern in ("*/lib/**/*.d.ts", "*/lib/**/*.js"):
+        for path in modules.glob("@deepseek-ai/" + pattern):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for name in names - found:
+                if name in text:
+                    found.add(name)
+            if found == names:
+                return found
+    return found
+
+
+def _annotate_service_lookups(results: dict[str, Probe]) -> None:
+    """Name the ``ctx.get`` lookups that entered the "service is present" branch.
+
+    The recording context answers every name with a working stub, so a plugin
+    guarding a block with ``if (ctx.get("x"))`` runs that block even when nothing
+    in the deployment provides ``x``. When something inside the block then throws,
+    the bare error reads like the plugin's own bug; this ties the two facts
+    together. The note is emitted only where it explains something — a probe whose
+    callback threw — and only for a name no probed plugin provides and the
+    installed core never spells, which is what makes ``undefined`` the answer a
+    real host would give.
+    """
+    looked_up = {name for probe in results.values() for name in probe.lookups}
+    if not looked_up:
+        return
+    absent = looked_up - provided_services(results) - core_service_names(looked_up)
+    if not absent:
+        return
+    for probe in results.values():
+        if not any(note_family(note)[0] == STUB_CAUSE for note in probe.notes):
+            continue
+        for name in sorted(set(probe.lookups) & absent):
+            note = (f"service lookup: ctx.get('{name}') — no probed plugin provides it and "
+                    f"the installed core never names it, so a real host resolves it to "
+                    f"undefined; the recording context answered it instead, and the branch "
+                    f"that used it may not run there at all")
+            if note not in probe.notes:
+                probe.notes.append(note)
+        probe.notes.sort()
 
 
 def probe_profile(profile, *, node: str | None = None, jobs: int = DEFAULT_JOBS,
@@ -704,6 +810,7 @@ def probe_profile(profile, *, node: str | None = None, jobs: int = DEFAULT_JOBS,
             except Exception as error:  # noqa: BLE001 - never let one plugin break the report
                 probe = Probe(name, FAILED, f"probe crashed: {error}", module=module)
             results[name] = merge_probe(results.get(name), probe)
+    _annotate_service_lookups(results)
     return results
 
 
@@ -761,6 +868,7 @@ def probe_from_payload(item) -> Probe | None:
         applied=bool(item.get("applied")),
         injects=[str(value) for value in item.get("injects") or []],
         calls=[str(value) for value in item.get("calls") or []],
+        lookups=[str(value) for value in item.get("lookups") or []],
         apply_error=item.get("apply_error"),
         live={str(key): int(value) for key, value in (item.get("live") or {}).items()},
         handlers=[record for record in item.get("handlers") or []
@@ -1011,6 +1119,14 @@ _STUB_INDUCIBLE = (
     re.compile(r"\bCannot read propert"),
     re.compile(r"\bCannot destructure\b"),
     re.compile(r"\bundefined is not\b"),
+    #: Node's own argument validation, reached when a stub proxy is handed to a
+    #: ``path``/``fs``/``Buffer`` call that wanted a string: a proxy is not one.
+    #: The message names the received value, and a proxy's ``name`` is
+    #: deliberately not answered (``PROTOCOL_KEYS``), which is why the reader
+    #: sees "Received function undefined" rather than a value.
+    re.compile(r"\bERR_INVALID_ARG_TYPE\b"),
+    re.compile(r"\bmust be of type\b"),
+    re.compile(r"\bReceived (?:function|an instance of|object|undefined|number)\b"),
 )
 
 
@@ -1037,6 +1153,69 @@ def _stub_inducible(text: str) -> bool:
 def _stub_note(text: str) -> str:
     """A reminder that the probe may be the cause, when it plausibly is."""
     return " (the recording stub can cause this)" if _stub_inducible(text) else ""
+
+
+#: The kinds of probe note, for a reader who should not have to parse the sentence:
+#: ``SKIPPED`` — the probe deliberately did not call something (by design, not a
+#: finding); ``STUB_CAUSE`` — a plugin callback threw while the probe ran it, and
+#: the recording context is a plausible cause; ``PROBE_ERROR`` — the probe itself
+#: could not finish a step.
+SKIPPED = "skipped"
+STUB_CAUSE = "stub"
+PROBE_ERROR = "probe"
+UNCLASSIFIED = "other"
+
+#: Note prefix -> (kind, what the note means). The prefix is what the probe script
+#: writes; ``notes`` itself stays raw so ``--json`` keeps the probe's own words.
+_NOTE_FAMILIES = (
+    ("handler not called: ", SKIPPED,
+     "nothing is known about this route: it is neither a pass nor a failure"),
+    ("effect: ", STUB_CAUSE,
+     "a callback the plugin scheduled with ctx.effect threw while the probe ran it"),
+    ("inject: ", STUB_CAUSE,
+     "the registration callback the plugin passed to ctx.inject threw while the probe ran it"),
+    ("handler probe: ", PROBE_ERROR,
+     "the probe could not run one registered handler — this says nothing about the plugin"),
+    ("service lookup: ", STUB_CAUSE,
+     "this is what put the failure above within the probe's reach: a branch a real "
+     "host would skip"),
+)
+
+
+def note_family(note: str) -> tuple[str, str]:
+    """The kind of one probe note, and what that kind of note means."""
+    text = str(note)
+    for prefix, kind, meaning in _NOTE_FAMILIES:
+        if text.startswith(prefix):
+            return kind, meaning
+    return UNCLASSIFIED, "the probe reported this without calling it a failure"
+
+
+def note_effect(note: str) -> str:
+    """A note's payload with its ``family: `` marker stripped."""
+    head, separator, rest = str(note).partition(": ")
+    return rest if separator else head
+
+
+def note_line(note: str) -> tuple[str, str]:
+    """One note as ``(headline, meaning)`` — what was reported, and whether it matters.
+
+    ``notes`` stays raw (it is also machine-readable output); this is the
+    reader-facing rendering. For a callback the recording stub could have broken by
+    itself, the headline carries the explicit reminder, so a bare ``TypeError``
+    from inside a registration callback is never mistaken for a plugin bug.
+    """
+    kind, meaning = note_family(note)
+    text = str(note)
+    if kind == SKIPPED:
+        path = note_effect(text).split(" (", 1)[0]
+        reason = ("the path names a mutation and the probe only sends GET"
+                  if "(the path names a mutation" in text
+                  else "the per-plugin handler budget was reached")
+        return f"GET {path} — not called: {reason}", meaning
+    if kind in (STUB_CAUSE, PROBE_ERROR):
+        return f"{note_effect(text)}{_stub_note(text)}", meaning
+    return text, meaning
 
 
 def handler_failure(record: dict) -> str | None:

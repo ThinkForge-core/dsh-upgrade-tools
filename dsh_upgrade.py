@@ -569,19 +569,39 @@ def _body_head(record: dict, limit: int = 60) -> str:
 
 
 def _print_probe_notes(probes: dict) -> None:
-    """Anything the probe reported without calling it a failure."""
+    """Anything the probe reported without calling it a failure.
+
+    The probe's own sentence is not enough for a reader: one line of prose cannot
+    say whether a route was skipped on purpose, whether a registration callback
+    was broken by the recording stub rather than by the plugin, or whether the
+    probe itself gave up. Each note is printed with its kind and with what that
+    kind means — and none of it is a verdict.
+    """
     noted = [probe for probe in sort_probes(probes) if probe.notes]
     if not noted:
         return
+
+    marks = {
+        verify_mod.SKIPPED: "skipped by design",
+        verify_mod.STUB_CAUSE: "stub may be the cause",
+        verify_mod.PROBE_ERROR: "probe error",
+        verify_mod.UNCLASSIFIED: "note",
+    }
+    width = max(len(mark) for mark in marks.values())
+
     print()
     print(style.heading("=== Probe notes ==="))
-    print(style.dim("  what the probe did not do, and what a plugin callback reported — "
-                    "reasons, not verdicts"))
+    print(style.dim("  none of these is a failure: each says what the probe did not do, or what a"))
+    print(style.dim("  plugin callback reported while the probe ran it"))
     for probe in noted:
         print()
         print(f"  {style.subheading(probe.name)}")
         for note in probe.notes:
-            print(style.dim(f"    {note}"))
+            headline, meaning = verify_mod.note_line(note)
+            mark = marks.get(verify_mod.note_family(note)[0], "note")
+            print(f"    {style.dim(mark.ljust(width))}  {headline}")
+            if meaning:
+                print(style.dim(f"      {meaning}"))
 
 
 def _print_loader_conflicts(effective) -> None:

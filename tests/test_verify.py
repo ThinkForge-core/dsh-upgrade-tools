@@ -515,5 +515,137 @@ class HandlerClassificationTest(unittest.TestCase):
             {"logs": ["error: ReferenceError: X is not defined"]}))
 
 
+class ProbeNoteTest(unittest.TestCase):
+    """How a probe note reads to a person, and what it must never become.
+
+    The probe writes its notes as prose. A sentence alone does not tell the reader
+    whether the probe skipped something on purpose, whether a registration callback
+    was broken by the recording stub, or whether the probe itself gave up — and the
+    whole point of the section is that none of those is a verdict.
+    """
+
+    def test_the_dshmarket_shape_is_stub_inducible(self):
+        """A stub proxy reaching ``path.isAbsolute`` is the probe's own doing.
+
+        The live shape: a plugin branches on ``ctx.get("desktopProfiles")``, the
+        recording context answers that name, its callback then hands the stub to a
+        ``path`` API, and Node rejects it. The message names no stub, so the
+        pattern set has to.
+        """
+        message = ('The "path" argument must be of type string. '
+                   'Received function undefined')
+        self.assertTrue(verify_mod._stub_inducible(message))
+        self.assertFalse(verify_mod._stub_immune(message))
+
+    def test_a_reference_error_stays_stub_immune(self):
+        self.assertFalse(verify_mod._stub_inducible(
+            "ReferenceError: MODELS_CACHE is not defined"))
+
+    def test_a_mutation_skip_reads_as_skipped_by_design(self):
+        note = ("handler not called: /sidebar/upload (the path names a mutation "
+                "and the probe only sends GET)")
+        kind, _ = verify_mod.note_family(note)
+        headline, meaning = verify_mod.note_line(note)
+        self.assertEqual(kind, verify_mod.SKIPPED)
+        self.assertIn("/sidebar/upload", headline)
+        self.assertNotIn("stub can cause", headline)
+        self.assertTrue(meaning)
+
+    def test_a_budget_skip_names_the_budget(self):
+        headline, _ = verify_mod.note_line(
+            "handler not called: /x (handler budget reached)")
+        self.assertIn("/x", headline)
+        self.assertIn("budget", headline)
+
+    def test_a_stub_caused_callback_carries_the_reminder(self):
+        note = ('inject: The "path" argument must be of type string. '
+                'Received function undefined')
+        kind, _ = verify_mod.note_family(note)
+        headline, meaning = verify_mod.note_line(note)
+        self.assertEqual(kind, verify_mod.STUB_CAUSE)
+        self.assertIn("the recording stub can cause this", headline)
+        self.assertNotIn("inject: ", headline)
+        self.assertTrue(meaning)
+
+    def test_a_probe_error_is_not_read_as_a_plugin_fault(self):
+        kind, meaning = verify_mod.note_family("handler probe: boom")
+        self.assertEqual(kind, verify_mod.PROBE_ERROR)
+        self.assertIn("nothing about the plugin", meaning)
+
+    def test_an_unknown_note_is_kept_verbatim(self):
+        headline, meaning = verify_mod.note_line("something new")
+        self.assertEqual(headline, "something new")
+        self.assertTrue(meaning)
+
+
+class ServiceLookupTest(unittest.TestCase):
+    """A ``ctx.get`` lookup that took the "service is present" branch.
+
+    The recording context answers every name, so a plugin guarding a block with
+    ``ctx.get("x")`` runs that block even where nothing provides ``x``. The note
+    ties that branch to the failure it produced — never to a working plugin, and
+    never for a name the core itself spells.
+    """
+
+    def annotate(self, probes, *, core=()):
+        with mock.patch.object(verify_mod, "core_service_names",
+                               return_value=set(core)):
+            verify_mod._annotate_service_lookups(probes)
+
+    def test_an_absent_lookup_is_named_when_a_callback_failed(self):
+        probes = {"demo": verify_mod.Probe(
+            "demo", verify_mod.LOADS, lookups=["desktopProfiles"],
+            notes=["inject: boom"])}
+        self.annotate(probes)
+        notes = " ".join(probes["demo"].notes)
+        self.assertIn("service lookup: ctx.get('desktopProfiles')", notes)
+        self.assertIn("undefined", notes)
+
+    def test_a_core_service_is_left_alone(self):
+        probes = {"demo": verify_mod.Probe(
+            "demo", verify_mod.LOADS, lookups=["credentials"], notes=["inject: boom"])}
+        self.annotate(probes, core={"credentials"})
+        self.assertEqual(probes["demo"].notes, ["inject: boom"])
+
+    def test_a_service_another_plugin_provides_is_left_alone(self):
+        probes = {
+            "demo": verify_mod.Probe("demo", verify_mod.LOADS,
+                                     lookups=["desktopProfiles"], notes=["inject: boom"]),
+            "owner": verify_mod.Probe("owner", verify_mod.LOADS,
+                                      calls=["ctx.provide(desktopProfiles)"]),
+        }
+        self.annotate(probes)
+        self.assertEqual(probes["demo"].notes, ["inject: boom"])
+
+    def test_a_working_plugin_gets_no_note(self):
+        probes = {"demo": verify_mod.Probe(
+            "demo", verify_mod.LOADS, lookups=["desktopProfiles"])}
+        self.annotate(probes)
+        self.assertEqual(probes["demo"].notes, [])
+
+    def test_the_reading_is_repeatable(self):
+        probes = {"demo": verify_mod.Probe(
+            "demo", verify_mod.LOADS, lookups=["desktopProfiles"], notes=["inject: boom"])}
+        self.annotate(probes)
+        first = list(probes["demo"].notes)
+        self.annotate(probes)
+        self.assertEqual(probes["demo"].notes, first)
+
+    def test_a_lookup_survives_the_cache(self):
+        probe = verify_mod.Probe("demo", verify_mod.LOADS, lookups=["desktopProfiles"])
+        restored = verify_mod.probe_from_payload(probe.to_dict())
+        self.assertEqual(restored.lookups, ["desktopProfiles"])
+
+    def test_the_installed_core_is_read_when_there_is_one(self):
+        """A real core answers for a real service — and not for a made-up name."""
+        if paths.core_install_dir() is None:
+            self.skipTest("no installed core to read")
+        found = verify_mod.core_service_names({"credentials", "notAServiceAtAll12345"})
+        if not found:
+            self.skipTest("the core spells neither name — nothing to assert")
+        self.assertIn("credentials", found)
+        self.assertNotIn("notAServiceAtAll12345", found)
+
+
 if __name__ == "__main__":
     unittest.main()

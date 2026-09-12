@@ -87,6 +87,11 @@ runs no wire scan.
   means the target core itself is out of reach (an older version than the installed one).
 * `verify` runs plugin code against a stub context. A failure the stub can produce on its own is
   reported as a lead, with that note; only stub-immune evidence is a verdict.
+* `=== Probe notes ===` — never a verdict. Each note is printed with its kind: `skipped by design` (the
+  probe deliberately did not call the route), `stub may be the cause` (a `ctx.effect`/`ctx.inject`
+  registration callback threw, or a `ctx.get` lookup entered a branch a real host would skip) and
+  `probe error` (the probe itself gave up). `note_family()` and `note_line()` classify and render a note;
+  `notes` in `--json` stays the probe's raw sentence, and `lookups` names every service that was looked up.
 
 In `verify --json` the `findings` list carries every finding with its `confidence`
 (`"verdict"` or `"lead"`), so the two kinds do not have to be told apart by the surface text.
