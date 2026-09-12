@@ -107,6 +107,16 @@ class WireCall:
     verdict: str = UNCHECKED
     note: str = ""
 
+    @property
+    def confidence(self) -> str:
+        """``verdict`` for a call classified against a core, ``lead`` otherwise.
+
+        A dead path and a mismatched method are read from the core's own endpoint
+        declarations, so they are proven. A call classified with no core at hand
+        (``unchecked``) is evidence for a reader, not a verdict.
+        """
+        return "verdict" if self.verdict in (OK, DEAD, MISMATCH) else "lead"
+
     def to_dict(self) -> dict:
         return {
             "plugin": self.plugin,
@@ -116,6 +126,7 @@ class WireCall:
             "source": self.source,
             "verdict": self.verdict,
             "note": self.note,
+            "confidence": self.confidence,
         }
 
 

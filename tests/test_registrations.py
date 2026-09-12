@@ -324,9 +324,10 @@ class TargetInventoryTest(unittest.TestCase):
 
     A plugin can reference a package that lives in the core's ``vendor/``
     directory (for example ``@deepseek-ai/schemastery``). The host inventory keeps
-    only dsh*/cordis* names, so vendor packages used to be missing from the target
-    side of the comparison and the plugin was reported as linking to a removed
-    package — a false incompatibility on a perfectly installable artifact.
+    only dsh*/cordis* names, so the vendor names are added to the target side of
+    the comparison explicitly — without them the plugin is reported as linking to
+    a removed package, a false incompatibility on a perfectly installable
+    artifact.
     """
 
     def test_vendor_packages_count_as_present_in_the_installed_core(self):

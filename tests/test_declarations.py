@@ -237,10 +237,10 @@ class InlinePolicyTest(unittest.TestCase):
         self.assertTrue(self._policy().allows(SESSION, subpath="lib/typert.remote-client.js"))
 
     def test_the_remote_exemption_never_covers_a_package_as_a_whole(self):
-        """Regression the check itself had: `/remote` matched EVERY dsh-* package.
+        """The exemption must stay on the module read, never on the package.
 
-        Synthesizing ``<package>/remote`` for the base name made the exemption
-        match ``@deepseek-ai/dsh-<anything>``, so the inline check could never fire.
+        Synthesizing ``<package>/remote`` for the base name would make it match
+        ``@deepseek-ai/dsh-<anything>``, and the inline check could never fire.
         """
         policy = self._policy()
         self.assertFalse(policy.allows(SESSION, subpath="lib/client.js"))

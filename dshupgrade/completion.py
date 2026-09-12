@@ -4,8 +4,8 @@ The tool asks for paths (an artifact to inspect, a snapshot to restore from, the
 directory the version checkouts should live in). Typing a path by hand invites
 typos, so where the input really is a terminal the reader is wired to
 ``readline``: the line editing of an ordinary shell (arrows, Home/End, Ctrl+A/E),
-Tab completion of files and directories, and history for previously entered
-paths.
+Tab completion of files and directories, and a recall list of the paths entered
+before.
 
 ``readline`` is a stdlib module but is not guaranteed to exist (some embedded
 builds), so nothing here imports it eagerly: :func:`path_candidates` and

@@ -31,11 +31,14 @@ import json
 import os
 import subprocess
 import sys
+import time
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dshupgrade import analysis as analysis_mod  # noqa: E402
+from dshupgrade import codes as codes_mod  # noqa: E402
 from dshupgrade import config as config_mod  # noqa: E402
 from dshupgrade import effects as effects_mod  # noqa: E402
 from dshupgrade import invocation as invocation_mod  # noqa: E402
@@ -103,25 +106,85 @@ def resolve_target(args) -> str:
     newest = registry.newest_core_version(offline=getattr(args, "offline", False))
     if newest is not None:
         print(style.dim(f"  auto target: {style.subheading(newest)} — the newest published "
-                        "version (use --core to pick another one)"))
+                        "version (use --core to pick another one)"), file=_log_stream(args))
         return newest
     current = core_version()
     if current:
         print(report.warning(f"registry unavailable — falling back to the installed core "
-                             f"{current} as the target"))
+                             f"{current} as the target"), file=_log_stream(args))
         return current
     raise SystemExit("could not determine the core version: pass --core")
 
 
 def analyse_for(args, profile, target: str):
+    log_to = _log_stream(args)
     return analysis_mod.analyse(
         profile,
         target,
         offline=args.offline,
         allow_clone=not args.no_clone,
         check_updates=getattr(args, "update", False),
-        log=lambda text: print(style.dim(f"  {text}")),
+        log=lambda text: print(style.dim(f"  {text}"), file=log_to),
     )
+
+
+def _quiet(args) -> bool:
+    """True when stdout is reserved for one machine-readable value.
+
+    ``--json`` writes a single document there, ``--summary`` writes a single line:
+    neither tolerates a report mixed into it. Progress and notes then go to
+    stderr, where a human still sees them and a parser never reads them.
+    """
+    return bool(getattr(args, "json", False) or getattr(args, "summary", False))
+
+
+def _log_stream(args):
+    """Where progress lines go: stderr when stdout is reserved, else stdout."""
+    return sys.stderr if _quiet(args) else sys.stdout
+
+
+@contextmanager
+def _report_console(args):
+    """Human report text: stdout normally, stderr when stdout carries JSON.
+
+    The report is not dropped — it keeps being printed where a reader looks — only
+    moved off the stream a script parses.
+    """
+    if getattr(args, "json", False):
+        with redirect_stdout(sys.stderr):
+            yield
+    else:
+        yield
+
+
+def summary_payload(*, total: int, incompatible: int, unknown: int, wire_dead: int,
+                    handler_failures: int, exit_code: int) -> dict:
+    """The one-line summary as data, with the code the command returns."""
+    return {
+        "total": total,
+        "incompatible": incompatible,
+        "unknown": unknown,
+        "wire_dead": wire_dead,
+        "handler_failures": handler_failures,
+        "exit_code": exit_code,
+    }
+
+
+def summary_line(payload: dict) -> str:
+    """The summary as the one line it is meant to be."""
+    return (f"{payload['total']} plugins checked, "
+            f"{payload['incompatible']} incompatible, "
+            f"{payload['unknown']} unknown, "
+            f"{payload['wire_dead']} wire-dead, "
+            f"{payload['handler_failures']} handler-failures")
+
+
+def emit_summary(payload: dict, args) -> None:
+    """Print the summary: one line, or one JSON object with ``--json``."""
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(summary_line(payload))
 
 
 def print_data_note(names: list[str]) -> None:
@@ -138,6 +201,14 @@ def print_data_note(names: list[str]) -> None:
 
 def _path_row(path) -> str:
     return style.path(path)
+
+
+def _file_date(path: Path) -> str:
+    """Calendar date of a saved report, when it records no generation time."""
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(path.stat().st_mtime))
+    except OSError:
+        return "unknown"
 
 
 # --------------------------------------------------------------------------- #
@@ -277,7 +348,8 @@ def _status_probes(args, profile, current: str | None) -> dict:
     fingerprint, so the table is refreshed exactly once per upgrade).
     """
     if getattr(args, "verify", False):
-        return verify_mod.resolve(profile, current, refresh=False, allow_probe=True, log=print)
+        return verify_mod.resolve(profile, current, refresh=False, allow_probe=True,
+                                  log=lambda text: print(text, file=_log_stream(args)))
     return verify_mod.load_cache(profile, current)
 
 
@@ -286,6 +358,33 @@ def _surface_flags(name: str, shadows: dict, wire: dict | None = None) -> dict:
     certain, suspect = effects_mod.shadow_flags(shadows.get(name, []))
     return {"shadowed": certain, "suspect": suspect,
             "dead_wire": len((wire or {}).get(name, []))}
+
+
+def _probes_summary(profile, probes: dict, wire: dict, exit_code: int) -> dict:
+    """The summary of a profile whose plugins carry runtime verdicts.
+
+    ``incompatible`` counts the server entries that do not import, ``unknown`` the
+    plugins no verdict was produced for (not installed, or the probe could not
+    run), ``wire_dead`` the plugins with a call the core does not serve and
+    ``handler_failures`` the plugins with a route that fails on its first call.
+    """
+    incompatible = 0
+    unknown = 0
+    handler_failures = 0
+    for plugin in profile.plugins:
+        probe = probes.get(plugin.name)
+        if probe is None:
+            unknown += 1
+            continue
+        if probe.status == verify_mod.FAILED:
+            incompatible += 1
+        elif probe.status in (verify_mod.UNAVAILABLE, verify_mod.MISSING):
+            unknown += 1
+        if verify_mod.handler_failures(probe):
+            handler_failures += 1
+    return summary_payload(total=len(profile.plugins), incompatible=incompatible,
+                           unknown=unknown, wire_dead=len(wire),
+                           handler_failures=handler_failures, exit_code=exit_code)
 
 
 def _surface_cell(plugin, probes: dict, shadows: dict, clients: set,
@@ -562,6 +661,10 @@ def cmd_status(args) -> int:
     effective, shadows, clients = profile_surfaces(profile, probes)
     wire = wire_surfaces(profile)
 
+    if getattr(args, "summary", False):
+        emit_summary(_probes_summary(profile, probes, wire, 0), args)
+        return 0
+
     def plugin_payload(plugin) -> dict:
         payload = plugin.to_dict()
         probe = probes.get(plugin.name)
@@ -699,8 +802,8 @@ def _print_loader(effective, shadows: dict | None = None) -> None:
 def loader_payload(effective, shadows: dict | None = None) -> dict:
     """The tree as data — what ``--json --loader`` returns.
 
-    ``--loader`` used to be dropped without a word when ``--json`` was also given;
-    a flag that is silently ignored is worse than one that does not exist.
+    ``--loader`` is honoured together with ``--json``: a flag that is silently
+    ignored is worse than one that does not exist.
     """
     needed = _needed_rows(shadows)
     rows = []
@@ -725,6 +828,81 @@ def print_loader_tree(profile, shadows: dict | None = None) -> None:
     _print_loader(effective, shadows)
 
 
+def findings_payload(probes: dict, shadows: dict, wire: dict) -> list[dict]:
+    """Every runtime finding, with the confidence it is worth.
+
+    One list over the three sources — broken route handlers, shadowed surfaces and
+    calls the core does not serve — so a consumer does not have to know which
+    per-plugin structure a finding lives in. ``confidence`` separates a verdict
+    (proven by the probe, or by the core's own endpoint declarations) from a lead
+    (evidence a reader still has to confirm).
+    """
+    findings: list[dict] = []
+    for probe in sort_probes(probes):
+        for reason, record in verify_mod.handler_failures(probe):
+            findings.append({
+                "plugin": probe.name,
+                "surface": verify_mod.HANDLER_FAILED,
+                "confidence": "verdict",
+                "detail": reason,
+                "path": record.get("path"),
+                "reason_code": codes_mod.HANDLER_REFERENCE_ERROR,
+            })
+        for reason, record in verify_mod.handler_leads(probe):
+            findings.append({
+                "plugin": probe.name,
+                "surface": verify_mod.HANDLER_SUSPECT,
+                "confidence": "lead",
+                "detail": reason,
+                "path": record.get("path"),
+            })
+    for name in sorted(shadows):
+        for shadow in shadows[name]:
+            if shadow.explained:
+                continue
+            findings.append({
+                "plugin": name,
+                "surface": (verify_mod.SHADOWED if shadow.certain
+                            else verify_mod.SHADOW_SUSPECT),
+                "confidence": shadow.confidence,
+                "detail": shadow.evidence,
+                "row": shadow.row.id,
+            })
+    for name in sorted(wire):
+        for call in wire[name]:
+            findings.append({
+                "plugin": name,
+                "surface": verify_mod.WIRE_DEAD,
+                "confidence": call.confidence,
+                "detail": (f"{call.path}: {call.note}" if call.note else call.path),
+                "path": call.path,
+                "reason_code": codes_mod.primary(codes_mod.wire_codes([call.verdict])),
+            })
+    return findings
+
+
+def _print_diff(payload: dict) -> None:
+    """Human-readable comparison of two verification results."""
+    since = payload.get("since") or "the baseline"
+    print()
+    print(style.heading(f"=== Changes since {since} ==="))
+    if not (payload["changed"] or payload["added"] or payload["removed"]):
+        print(style.dim("  no changes"))
+        return
+    for item in payload["changed"]:
+        print(f"  {style.subheading(item['plugin'])}")
+        for field, values in item["fields"].items():
+            line = f"    {field + ':':<9}{values['old']} → {values['new']}"
+            if (field == "loads" and values["old"] == verify_mod.LABELS[verify_mod.FAILED]
+                    and values["new"] == verify_mod.LABELS[verify_mod.LOADS]):
+                line += "  " + style.good("(fixed)")
+            print(line)
+    for name in payload["added"]:
+        print(f"  {style.subheading(name)}: added")
+    for name in payload["removed"]:
+        print(f"  {style.dim(name)}: removed")
+
+
 def cmd_verify(args) -> int:
     """Import every installed plugin with node and report which ones load.
 
@@ -736,29 +914,47 @@ def cmd_verify(args) -> int:
     install_dir = core_install_dir()
     current = core_version(install_dir)
     profile = load_profile(args)
+    json_mode = bool(getattr(args, "json", False))
+    summary_mode = bool(getattr(args, "summary", False))
+    diff_path = getattr(args, "diff", None)
+
     if current is None:
-        print(report.warning("the installed core was not found — a probe would prove nothing"))
+        print(report.warning("the installed core was not found — a probe would prove nothing"),
+              file=_log_stream(args))
         return 1
 
-    print()
-    print(style.heading("=== Runtime verification ==="))
-    print(f"  core: {style.subheading(current)}")
-    print(f"  profile: {style.subheading(profile.name)} ({_path_row(profile.directory)})")
-    print(style.dim("  importing each installed server entry with node, in the profile "
-                    "directory — client-only bundles are not executed (static scans cover them)"))
-    print(style.dim("  then calling apply() against a recording context, to see what each "
-                    "plugin registers"))
-    print(style.dim("  then calling every route handler apply() registered, once, and "
-                    "reading what it threw and logged"))
+    if not (summary_mode or diff_path):
+        with _report_console(args):
+            print()
+            print(style.heading("=== Runtime verification ==="))
+            print(f"  core: {style.subheading(current)}")
+            print(f"  profile: {style.subheading(profile.name)} ({_path_row(profile.directory)})")
+            print(style.dim("  importing each installed server entry with node, in the profile "
+                            "directory — client-only bundles are not executed (static scans cover them)"))
+            print(style.dim("  then calling apply() against a recording context, to see what each "
+                            "plugin registers"))
+            print(style.dim("  then calling every route handler apply() registered, once, and "
+                            "reading what it threw and logged"))
+
     cached_only = bool(getattr(args, "cached", False))
     handlers = not bool(getattr(args, "no_handlers", False))
+
+    def progress(text: str) -> None:
+        print(text, file=_log_stream(args))
+
     probes = verify_mod.resolve(profile, current, refresh=not cached_only,
-                                allow_probe=not cached_only, log=print, handlers=handlers)
+                                allow_probe=not cached_only, log=progress, handlers=handlers)
     if not probes:
         if cached_only:
-            print(report.warning("no cached verdicts yet — run verify without --cached"))
+            print(report.warning("no cached verdicts yet — run verify without --cached"),
+                  file=_log_stream(args))
         else:
-            print(report.warning("nothing to verify (no installed plugins)"))
+            print(report.warning("nothing to verify (no installed plugins)"),
+                  file=_log_stream(args))
+        if summary_mode:
+            emit_summary(summary_payload(total=len(profile.plugins), incompatible=0,
+                                         unknown=len(profile.plugins), wire_dead=0,
+                                         handler_failures=0, exit_code=0), args)
         return 0
 
     effective, shadows, clients = profile_surfaces(profile, probes)
@@ -766,12 +962,37 @@ def cmd_verify(args) -> int:
     live_note = None
     if getattr(args, "live", False):
         base_url = getattr(args, "web_url", None) or verify_mod.DEFAULT_WEB_URL
-        reachable, verdicts = verify_mod.live_probe(probes, base_url=base_url, log=print)
+        reachable, verdicts = verify_mod.live_probe(probes, base_url=base_url, log=progress)
         if reachable:
             verify_mod.apply_live(probes, verdicts)
         else:
             live_note = (f"nothing answers at {base_url} — start 'dsh web' to confirm the "
                          "routes it serves (--web-url overrides the address)")
+
+    counts = {status: sum(1 for probe in probes.values() if probe.status == status)
+              for status in (verify_mod.LOADS, verify_mod.FAILED, verify_mod.CLIENT_ONLY,
+                             verify_mod.MISSING, verify_mod.UNAVAILABLE)}
+    exit_code = 2 if counts[verify_mod.FAILED] else 0
+
+    if diff_path:
+        path = Path(diff_path).expanduser()
+        if not path.is_file():
+            raise SystemExit(f"diff baseline not found: {path}")
+        try:
+            generated, old_items = verify_mod.load_verified(path)
+        except ValueError as error:
+            raise SystemExit(f"diff baseline unreadable: {error}")
+        payload = verify_mod.diff_probes(old_items, probes)
+        payload["since"] = (generated or "").split("T")[0] or _file_date(path)
+        if json_mode:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            _print_diff(payload)
+        return exit_code
+
+    if summary_mode:
+        emit_summary(_probes_summary(profile, probes, wire, exit_code), args)
+        return exit_code
 
     rows = []
     for probe in sort_probes(probes):
@@ -789,38 +1010,37 @@ def cmd_verify(args) -> int:
                      if entry is not None else style.warn("?"),
                      f"{probe.ms} ms" if probe.ms else "—",
                      detail])
-    print()
-    print(report.grouped_table(["plugin", "version", "loads", "surface", "time", "detail"],
-                               [("", rows)]))
-    _print_loads_legend(probes)
-    _print_surface_legend(probes, shadows, clients, wire)
-    if live_note:
+    with _report_console(args):
         print()
-        print(report.warning(live_note))
+        print(report.grouped_table(["plugin", "version", "loads", "surface", "time", "detail"],
+                                   [("", rows)]))
+        _print_loads_legend(probes)
+        _print_surface_legend(probes, shadows, clients, wire)
+        if live_note:
+            print()
+            print(report.warning(live_note))
 
-    counts = {status: sum(1 for probe in probes.values() if probe.status == status)
-              for status in (verify_mod.LOADS, verify_mod.FAILED, verify_mod.CLIENT_ONLY,
-                             verify_mod.MISSING, verify_mod.UNAVAILABLE)}
-    print()
-    print("  " + "   ".join((
-        style.good(f"load: {counts[verify_mod.LOADS]}"),
-        style.bad(f"fail: {counts[verify_mod.FAILED]}"),
-        style.dim(f"client-only: {counts[verify_mod.CLIENT_ONLY]}"),
-        style.warn(f"unavailable: {counts[verify_mod.UNAVAILABLE]}"),
-    )))
-    print(f"  cached in: {_path_row(verify_mod.cache_path(profile.name))}")
-    _print_load_failures(probes)
-    _print_handlers(probes)
-    _print_wire(wire)
-    _print_shadows(shadows, effective, hint=invocation_mod.loader_hint(profile.name))
-    _print_loader_conflicts(effective)
-    if getattr(args, "loader", False):
-        _print_loader(effective, shadows)
+        print()
+        print("  " + "   ".join((
+            style.good(f"load: {counts[verify_mod.LOADS]}"),
+            style.bad(f"fail: {counts[verify_mod.FAILED]}"),
+            style.dim(f"client-only: {counts[verify_mod.CLIENT_ONLY]}"),
+            style.warn(f"unavailable: {counts[verify_mod.UNAVAILABLE]}"),
+        )))
+        print(f"  cached in: {_path_row(verify_mod.cache_path(profile.name))}")
+        _print_load_failures(probes)
+        _print_handlers(probes)
+        _print_wire(wire)
+        _print_shadows(shadows, effective, hint=invocation_mod.loader_hint(profile.name))
+        _print_loader_conflicts(effective)
+        if getattr(args, "loader", False):
+            _print_loader(effective, shadows)
 
-    if args.json:
+    if json_mode:
         payload = {"core": current, "profile": profile.name,
                    "fingerprint": verify_mod.fingerprint(profile, current),
                    "plugins": [probe.to_dict() for probe in sort_probes(probes)],
+                   "findings": findings_payload(probes, shadows, wire),
                    "shadowed": {name: [shadow.to_dict() for shadow in items]
                                 for name, items in shadows.items()},
                    "wire": {name: [call.to_dict() for call in calls]
@@ -830,27 +1050,35 @@ def cmd_verify(args) -> int:
             payload["loader"] = loader_payload(effective, shadows)
         print()
         print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 2 if counts[verify_mod.FAILED] else 0
+    return exit_code
 
 
 def cmd_check(args) -> int:
     profile = load_profile(args)
     target = resolve_target(args)
     result = analyse_for(args, profile, target)
-    report.print_analysis(result, verbose=args.verbose)
+    exit_code = 2 if result.incompatible() else 0
+    counts = result.counts()
+    json_mode = bool(getattr(args, "json", False))
+    summary_mode = bool(getattr(args, "summary", False))
 
-    if args.json:
+    if not summary_mode:
+        with _report_console(args):
+            report.print_analysis(result, verbose=args.verbose)
+
+    document = {
+        "target": result.target,
+        "current": result.current_core,
+        "counts": counts,
+        "removed": result.removed,
+        "notes": result.notes,
+        "plugins": result.plugins,
+    }
+    paths: dict[str, str] = {}
+    if json_mode:
         out = state_dir() / f"check-{target}.json"
-        snapshot.write_json(out, {
-            "target": result.target,
-            "current": result.current_core,
-            "counts": result.counts(),
-            "removed": result.removed,
-            "notes": result.notes,
-            "plugins": result.plugins,
-        })
-        print()
-        print(f"  detailed report: {_path_row(out)}")
+        snapshot.write_json(out, document)
+        paths["report"] = str(out)
 
     # The list is ALWAYS written (including when there is nothing proven
     # incompatible): it is also the state used by recheck and by the menu viewer,
@@ -859,10 +1087,26 @@ def cmd_check(args) -> int:
     entries = [analysis_mod.incompatible_entry(plugin) for plugin in result.plugins
                if plugin["status"] != STATUS_COMPATIBLE]
     json_path, md_path = snapshot.write_incompatible(target, entries, note="check")
+    paths["incompatible"] = str(json_path)
+    paths["markdown"] = str(md_path)
+
+    if summary_mode:
+        emit_summary(summary_payload(
+            total=len(result.plugins),
+            incompatible=counts.get(STATUS_INCOMPATIBLE, 0),
+            unknown=counts.get(STATUS_UNKNOWN, 0),
+            wire_dead=0, handler_failures=0, exit_code=exit_code), args)
+        return exit_code
+
+    if json_mode:
+        document["state"] = paths
+        print(json.dumps(document, ensure_ascii=False, indent=2, default=str))
+        return exit_code
+
     print()
     print(f"  incompatible list: {_path_row(json_path)}")
     print(f"  human readable:    {_path_row(md_path)}")
-    return 2 if result.incompatible() else 0
+    return exit_code
 
 
 # --------------------------------------------------------------------------- #
@@ -984,6 +1228,14 @@ def cmd_inspect(args) -> int:
         since=args.since,
         log=log,
     )
+
+    # A dead call is a finding of the artifact itself, so it fills the reason code
+    # when the static checks produced none: the artifact is otherwise "compatible"
+    # and still does not work.
+    if calls:
+        found = codes_mod.wire_codes([call.verdict for call in calls])
+        for entry in result.plugins:
+            entry["reason_code"] = codes_mod.primary([entry.get("reason_code"), *found])
 
     if args.json:
         print(analysis_mod.describe_json({
@@ -1577,6 +1829,8 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--loader", action="store_true",
                         help="also print the effective loader tree: every row, what mounts "
                              "it and who disabled it")
+    status.add_argument("--summary", action="store_true",
+                        help="print one line of counts instead of the full report")
     status.set_defaults(func=cmd_status)
 
     runtime = add("verify", "do the installed plugins actually load — and do they do "
@@ -1596,6 +1850,12 @@ def build_parser() -> argparse.ArgumentParser:
     runtime.add_argument("--loader", action="store_true",
                          help="also print the effective loader tree, with the rows the "
                               "shadowed plugins draw into marked")
+    comparison = runtime.add_mutually_exclusive_group()
+    comparison.add_argument("--summary", action="store_true",
+                            help="print one line of counts instead of the full report")
+    comparison.add_argument("--diff", metavar="PATH",
+                            help="compare with a verified JSON saved earlier and print only "
+                                 "the differences (a state/verified-<profile>.json file)")
     runtime.set_defaults(func=cmd_verify)
 
     plan = add("plan", "overview of all new core versions: what happens to the plugins")
@@ -1605,6 +1865,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     check = add("check", "compatibility matrix for a core version")
     check.add_argument("--update", action="store_true", help="also check the newest plugin versions")
+    check.add_argument("--summary", action="store_true",
+                       help="print one line of counts instead of the full report")
     check.set_defaults(func=cmd_check)
 
     inspect = add("inspect", "check an artifact that is NOT installed yet (directory or tarball)")

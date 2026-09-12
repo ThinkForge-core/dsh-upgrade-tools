@@ -467,12 +467,12 @@ REFERENCE = "reference"
 class Shadow:
     """A host surface a plugin needs that the effective profile switched off.
 
-    ``kind`` separates the two findings that used to be printed as one. A
-    ``declared`` shadow is a verdict: ``package.json``'s ``dsh.client.inject``
-    names a module whose loader row is off, so the client half cannot be composed.
-    A ``reference`` shadow is a lead: the disabled row's id or module name occurs
-    in the client half's text — a comment naming the component it augments, say —
-    and the client half only *may* need it.
+    ``kind`` separates the two findings. A ``declared`` shadow is a verdict:
+    ``package.json``'s ``dsh.client.inject`` names a module whose loader row is
+    off, so the client half cannot be composed. A ``reference`` shadow is a lead:
+    the disabled row's id or module name occurs in the client half's text — a
+    comment naming the component it augments, say — and the client half only *may*
+    need it.
     """
 
     plugin: str
@@ -494,6 +494,11 @@ class Shadow:
         """True when another enabled row reproduces the DOM contract it needs."""
         return self.replaced_by is not None
 
+    @property
+    def confidence(self) -> str:
+        """``verdict`` when the manifest produced the finding, ``lead`` otherwise."""
+        return "verdict" if self.certain else "lead"
+
     def to_dict(self) -> dict:
         return {
             "plugin": self.plugin,
@@ -505,6 +510,7 @@ class Shadow:
             "route_count": self.route_count,
             "kind": self.kind,
             "replaced_by": self.replaced_by,
+            "confidence": self.confidence,
         }
 
 

@@ -189,11 +189,11 @@ beats the saved setting (see [Environment variables](#environment-variables)).
 | Command | What it does |
 |---|---|
 | `menu` | Interactive menu (the same one opens with no arguments). |
-| `status [--verify] [--loader]` | Core version and directory, tags, recent versions, table of plugins with sources **and `loads` + `surface` columns** — whether the installed copy imports, and what it actually registers. `--verify` fills them in (probes only when what it measured has changed); `--loader` prints the whole effective loader tree, marking the rows a shadowed plugin draws into. |
-| `verify [--cached] [--live] [--no-handlers] [--web-url URL] [--loader]` | Import the installed copy of every plugin with `node`, call its `apply()`, then **call every route handler `apply()` registered once** and read what it threw and logged — plus which plugins have a **shadowed surface** (their UI host row is switched off). `--live` also GETs every registered route on the running DSH (`--web-url`, default `http://127.0.0.1:3080`), which proves the row applied. `--no-handlers` skips the handler calls — a weaker answer, so it is not cached. `--loader` prints the effective loader tree with the shadowed rows marked. Writes `state/verified-<profile>.json`. |
+| `status [--verify] [--loader] [--summary]` | Core version and directory, tags, recent versions, table of plugins with sources **and `loads` + `surface` columns** — whether the installed copy imports, and what it actually registers. `--verify` fills them in (probes only when what it measured has changed); `--loader` prints the whole effective loader tree, marking the rows a shadowed plugin draws into; `--summary` prints one line of counts instead of the report. |
+| `verify [--cached] [--live] [--no-handlers] [--web-url URL] [--loader] [--summary \| --diff PATH]` | Import the installed copy of every plugin with `node`, call its `apply()`, then **call every route handler `apply()` registered once** and read what it threw and logged — plus which plugins have a **shadowed surface** (their UI host row is switched off). `--live` also GETs every registered route on the running DSH (`--web-url`, default `http://127.0.0.1:3080`), which proves the row applied. `--no-handlers` skips the handler calls — a weaker answer, so it is not cached. `--loader` prints the effective loader tree with the shadowed rows marked. `--summary` prints one line of counts; `--diff PATH` prints only what changed since a result saved earlier. Writes `state/verified-<profile>.json`. |
 | `core-versions` | All core versions and tags, how many are newer than the installed one. |
 | `plan [--limit N] [--all]` | **In a single run**: all new core versions and what happens to plugins on each (fast, declarations only). |
-| `check --core V [--update]` | Compatibility matrix: what happens to each plugin on version `V`. Writes the incompatible list. |
+| `check --core V [--update] [--summary]` | Compatibility matrix: what happens to each plugin on version `V`. Writes the incompatible list; `--summary` prints one line of counts instead of the matrix. |
 | `inspect PATH [--core V] [--since OLD]` | Compatibility of an artifact that is **not installed yet** — a plugin directory or a `.tgz`. Reads only that artifact; the profile is not read and nothing is installed. |
 | `detach [--yes]` | Snapshot of the profile and detaching of ALL plugins. Without `--yes` it only writes the snapshot and aborts. |
 | `attach [--from F] [--update] [--install-unknown] [--prune-failed] [--yes]` | Installation from a snapshot: installs the compatible ones, the rest go into the list. |
@@ -228,6 +228,93 @@ nor proven broken, so `pipeline`, `attach` and `recheck` install it only with
 default. Whatever is installed that way is re-judged afterwards by the post-check over the code
 that actually landed, and the failures go into the incompatible list.
 
+## Reports for scripts and agents
+
+`status`, `check`, `verify` and `inspect` accept `--json`. Stdout then carries exactly one JSON
+document and the human report and progress lines go to stderr, so the document can be piped into a
+parser without filtering. `check --json` still writes `state/check-<core>.json`, and the paths it
+wrote are listed in the document under `state`. `status`, `check` and `verify` also accept
+`--summary`.
+
+**Reason codes.** Every plugin entry of `check` and `inspect` carries a `reason_code` beside its
+`reason` text, so a consumer can classify a finding without parsing prose. A plugin that fails
+several checks at once carries the code of the most fundamental one; the detailed hits stay in the
+entry's own lists.
+
+| code | finding |
+|---|---|
+| `PEER_RANGE_MISMATCH` | a `peerDependencies` range does not admit the target core |
+| `ENGINES_DSH_MISMATCH` | `engines.dsh` does not admit the target core |
+| `REMOVED_PACKAGE_REQUIRED` | the code requires a package the target core no longer ships |
+| `BROWSER_MODULE_TABLE_MISS` | a client bundle requires a name missing from the target module table |
+| `DUPLICATE_FACTORY_REGISTRATION` | a client bundle registers a factory id the host already owns |
+| `DECLARATION_INTEGRITY_FAILURE` | the `dsh.client` declaration, or the bundle it promises, is not loadable on any core |
+| `INLINE_PURITY_VIOLATION` | a client bundle inlines a package that must come from the module table |
+| `WIRE_ENDPOINT_DEAD` | a literal `/api` call names an endpoint the target core does not serve |
+| `WIRE_METHOD_MISMATCH` | the endpoint is served, but the envelope's own method disagrees with it |
+| `HANDLER_REFERENCE_ERROR` | a registered route handler threw a `ReferenceError` on its first call |
+| `UNKNOWN_DECLARATIONS` | the manifest declares no DSH version — nothing to compare against |
+
+The field is `null` when no check produced a finding with an identifier: a compatible plugin, or a
+manifest that could not be read at all.
+
+**Blocking the core upgrade.** Every plugin entry of `check --json` carries `blocks_core_upgrade`,
+the answer to "if the pipeline runs, will it stop?". The pipeline holds an incompatible plugin back
+and installs the rest, so the field is `false` for a plugin-level incompatibility however the
+declarations read. It is `true` only when the target core itself is out of reach — a version older
+than the installed one, which an upgrade cannot move down to.
+
+**Verdict or lead.** In `verify --json` the `findings` list collects the runtime findings from all
+three sources — broken route handlers, shadowed surfaces and calls the core does not serve — and
+gives each a `confidence`:
+
+```json
+{
+  "plugin": "example-plugin",
+  "surface": "handler!",
+  "confidence": "verdict",
+  "detail": "the first call threw: ReferenceError: SOME_CACHE is not defined",
+  "path": "/api/example",
+  "reason_code": "HANDLER_REFERENCE_ERROR"
+}
+```
+
+`"verdict"` is a proof — the probe saw a failure the recording stub cannot have caused, or the
+core's own declarations do not contain the call. `"lead"` is evidence a reader still has to
+confirm. The per-plugin structures (`plugins`, `shadowed`, `wire`) stay in the document unchanged,
+and the shadow and wire entries carry the same `confidence` field.
+
+**One line of counts.** `--summary` replaces the report with a single line:
+
+```
+5 plugins checked, 2 incompatible, 1 unknown, 1 wire-dead, 0 handler-failures
+```
+
+With `--json` the same numbers are one object — `total`, `incompatible`, `unknown`, `wire_dead`,
+`handler_failures` and `exit_code` (the code the command returns). `incompatible` counts the
+plugins with a definite negative status, `unknown` the ones no verdict was produced for, and
+`wire_dead` and `handler_failures` the plugins with a dead call and with a route handler that fails
+on its first call.
+
+**Comparing two runs.** `verify --diff PATH` reads a result saved earlier (`state/verified-<profile>.json`,
+or any file with the same shape) and prints only what differs:
+
+```
+=== Changes since 2026-09-12 ===
+  example-plugin
+    loads:   no → yes  (fixed)
+    surface: routes:3 → apply!
+  gone-plugin: removed
+```
+
+The comparison covers the load verdict and the surface of every plugin, and reports a plugin present
+on one side only as added or removed. With `--json` it is
+`{"changed": [{"plugin": …, "fields": {"loads": {"old": …, "new": …}}}], "added": […],
+"removed": […], "unchanged_count": N, "since": "…"}`. The exit code is the one `verify` returns:
+`2` when a server entry does not load.
+
+`plan` and `core-versions` print their tables only; they take no `--json`.
+
 ## Output: colors, groups, wrapping
 
 * **Colors.** On a terminal the statuses are colored (`ok` green, `NO` red, `??` yellow), headings
@@ -238,10 +325,10 @@ that actually landed, and the failures go into the incompatible list.
   status (incompatible → unconfirmed → compatible), `status` by plugin source (npm / local / git),
   `plan` by outcome (safe → unconfirmed present → incompatible present), and the incompatible-list
   viewer by status.
-* **Long cells are wrapped, never truncated.** The `reason` column used to be cut at 60 characters
-  regardless of the terminal. Now the column widths are computed from the content, squeezed
-  proportionally to the terminal width, and anything that does not fit continues on the next line —
-  aligned under its own column. A full reason is always visible, at any width.
+* **Long cells are wrapped, never truncated.** The `reason` column is never cut: the column widths
+  are computed from the content, squeezed proportionally to the terminal width, and anything that
+  does not fit continues on the next line — aligned under its own column. A full reason is always
+  visible, at any width.
 
 ## How compatibility is decided
 

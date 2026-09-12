@@ -57,11 +57,10 @@ DEFAULT_JOBS = 8
 PROBE_TIMEOUT = 90
 
 #: Bumped whenever the probe starts measuring something new. It is part of the
-#: cache fingerprint, so upgrading the tool re-probes instead of trusting verdicts
-#: that answer a question this version no longer asks — an old cache has no
-#: ``apply()`` results in it, and reading it would report every plugin as
-#: "declarative". Version 3 adds the route-handler calls: a verdict from version 2
-#: says "the handler was registered", never "the handler runs".
+#: cache fingerprint, so a schema bump re-probes instead of trusting verdicts that
+#: answer a weaker question. The route-handler calls are part of the current
+#: schema: a verdict without them says "the handler was registered", never "the
+#: handler runs".
 PROBE_SCHEMA = 3
 
 #: Statuses.
@@ -740,27 +739,34 @@ def load_cache(profile, core: str | None) -> dict[str, Probe]:
         return {}
     results: dict[str, Probe] = {}
     for item in payload.get("plugins") or []:
-        if not isinstance(item, dict) or not item.get("name"):
-            continue
-        results[str(item["name"])] = Probe(
-            name=str(item["name"]),
-            status=str(item.get("status") or UNAVAILABLE),
-            detail=str(item.get("detail") or ""),
-            ms=int(item.get("ms") or 0),
-            entry=item.get("entry"),
-            module=item.get("module"),
-            exports=[str(value) for value in item.get("exports") or []],
-            routes=[route for route in item.get("routes") or [] if isinstance(route, dict)],
-            applied=bool(item.get("applied")),
-            injects=[str(value) for value in item.get("injects") or []],
-            calls=[str(value) for value in item.get("calls") or []],
-            apply_error=item.get("apply_error"),
-            live={str(key): int(value) for key, value in (item.get("live") or {}).items()},
-            handlers=[record for record in item.get("handlers") or []
-                      if isinstance(record, dict)],
-            notes=[str(value) for value in item.get("notes") or []],
-        )
+        probe = probe_from_payload(item)
+        if probe is not None:
+            results[probe.name] = probe
     return results
+
+
+def probe_from_payload(item) -> Probe | None:
+    """One :class:`Probe` from a saved ``plugins`` entry (None when unusable)."""
+    if not isinstance(item, dict) or not item.get("name"):
+        return None
+    return Probe(
+        name=str(item["name"]),
+        status=str(item.get("status") or UNAVAILABLE),
+        detail=str(item.get("detail") or ""),
+        ms=int(item.get("ms") or 0),
+        entry=item.get("entry"),
+        module=item.get("module"),
+        exports=[str(value) for value in item.get("exports") or []],
+        routes=[route for route in item.get("routes") or [] if isinstance(route, dict)],
+        applied=bool(item.get("applied")),
+        injects=[str(value) for value in item.get("injects") or []],
+        calls=[str(value) for value in item.get("calls") or []],
+        apply_error=item.get("apply_error"),
+        live={str(key): int(value) for key, value in (item.get("live") or {}).items()},
+        handlers=[record for record in item.get("handlers") or []
+                  if isinstance(record, dict)],
+        notes=[str(value) for value in item.get("notes") or []],
+    )
 
 
 def save_cache(profile, core: str | None, results: dict[str, Probe]) -> Path:
@@ -804,6 +810,81 @@ def resolve(profile, core: str | None, *, refresh: bool = False, allow_probe: bo
     if save and handlers:
         save_cache(profile, core, results)
     return results
+
+
+# --------------------------------------------------------------------------- #
+# Comparing two verification results
+# --------------------------------------------------------------------------- #
+
+#: The facts a comparison reads. They are the ones a saved result carries and a
+#: reader of the table sees in its own columns, so "what changed" needs no other
+#: input than the two results themselves.
+DIFF_FIELDS = ("loads", "surface")
+
+
+def load_verified(path) -> tuple[str | None, list[dict]]:
+    """Read a saved verification result: ``(generated, plugin entries)``.
+
+    Both forms the tool writes are accepted — the state file produced by
+    :func:`save_cache` (an object with a ``plugins`` list) and a bare list of
+    plugin entries. Raises ``ValueError`` when the file is not one of them.
+    """
+    payload = read_json(Path(path))
+    if payload is None:
+        raise ValueError(f"not readable JSON: {path}")
+    if isinstance(payload, list):
+        return None, [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        raise ValueError(f"not a verification result: {path}")
+    generated = payload.get("generated") if isinstance(payload.get("generated"), str) else None
+    items = [item for item in payload.get("plugins") or [] if isinstance(item, dict)]
+    return generated, items
+
+
+def probe_signature(probe: Probe) -> dict:
+    """The comparable facts of one probe: its load label and its surface."""
+    return {"loads": LABELS.get(probe.status, "?"), "surface": surface_text(probe)}
+
+
+def stored_signature(item: dict) -> dict:
+    """The same facts for a saved plugin entry."""
+    probe = probe_from_payload(item)
+    return probe_signature(probe) if probe is not None else {"loads": "?", "surface": "?"}
+
+
+def diff_probes(old_items: list[dict], current: dict[str, Probe]) -> dict:
+    """Differences between a saved result and the current probes.
+
+    Only ``(loads, surface)`` per plugin is compared, and a plugin present on one
+    side only is reported as added or removed: an empty ``changed`` list with a
+    non-zero ``unchanged_count`` means the two results agree on every plugin they
+    have in common.
+    """
+    old = {str(item["name"]): item for item in old_items
+           if isinstance(item, dict) and item.get("name")}
+    changed: list[dict] = []
+    added: list[str] = []
+    removed: list[str] = []
+    unchanged = 0
+    for name in sorted(set(old) | set(current)):
+        if name not in current:
+            removed.append(name)
+            continue
+        if name not in old:
+            added.append(name)
+            continue
+        before = stored_signature(old[name])
+        after = probe_signature(current[name])
+        fields = {
+            field: {"old": before[field], "new": after[field]}
+            for field in DIFF_FIELDS if before[field] != after[field]
+        }
+        if fields:
+            changed.append({"plugin": name, "fields": fields})
+        else:
+            unchanged += 1
+    return {"changed": changed, "added": added, "removed": removed,
+            "unchanged_count": unchanged}
 
 
 # --------------------------------------------------------------------------- #
@@ -1032,8 +1113,8 @@ def surface_text(probe: Probe, *, shadowed: bool = False, suspect: bool = False,
     """The ``surface`` cell: what this plugin actually puts into the deployment.
 
     ``loads`` says the code imported. This says what it does: how many surfaces
-    ``apply()`` registered, whether the live host serves them, or — the cases that
-    prompted this column — that the component its browser half draws into is
+    ``apply()`` registered, whether the live host serves them, or — the cases the
+    column exists for — that the component its browser half draws into is
     switched off, that its runtime calls address an endpoint this core does not
     serve, or that a route it registered is broken the moment it is called.
 

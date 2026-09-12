@@ -1,8 +1,8 @@
 """Tests for the effective loader tree and the shadowed-surface detector.
 
 ``verify`` answers "did the entry import". These tests cover the other question —
-"does the plugin do anything" — and, above all, the failure that prompted the
-whole module: a client half that draws into a component the profile switched off.
+"does the plugin do anything" — and, above all, the failure the whole module
+exists for: a client half that draws into a component the profile switched off.
 
 The patch parser is tested against the shapes that actually occur in the wild, in
 particular a ``!!js`` expression on ``disabled:``, an id-targeted disable in a later

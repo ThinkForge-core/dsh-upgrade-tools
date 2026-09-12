@@ -20,6 +20,7 @@ from functools import cmp_to_key
 from pathlib import Path
 
 from . import checkout as checkout_mod
+from . import codes
 from . import locals as locals_mod
 from . import registry
 from . import semver
@@ -60,6 +61,8 @@ class Analysis:
     preloaded: set[str] = field(default_factory=set)
     inline_policy: InlinePolicy | None = None
     session_format: int | None = None
+    #: Why the target version itself is out of the tool's reach, when it is.
+    core_conflict: str | None = None
     plugins: list[dict] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -93,6 +96,39 @@ def _latest_npm_version(name: str, *, offline: bool) -> str | None:
         return registry.dist_tags(name, offline=offline).get("latest")
     except RuntimeError:
         return None
+
+
+def core_conflict(current: str | None, target: str) -> str | None:
+    """Why an upgrade cannot reach ``target``, or None when it can.
+
+    The session format is versioned monotonically (``SESSION_FORMAT_VERSION``), so
+    a core older than the installed one is out of reach for an upgrade: the tool
+    can compare plugins against it, but nothing can move the installation down to
+    it. No plugin selection changes that, which is what makes it a fact about the
+    target core rather than about a plugin.
+    """
+    if current is None or current == target:
+        return None
+    if semver.parse_version(current) is None or semver.parse_version(target) is None:
+        return None
+    if semver.compare_version(target, current) < 0:
+        return (f"target {target} is older than the installed {current}; "
+                "an upgrade cannot reach it")
+    return None
+
+
+def apply_core_block(analysis: Analysis) -> None:
+    """Mark the plugins of a profile whose target core is out of reach.
+
+    ``blocks_core_upgrade`` answers one question — "if the pipeline runs, does it
+    stop?" — and a plugin-level incompatibility never stops it: the incompatible
+    plugins are held back and the rest proceeds. A core-level conflict (see
+    :func:`core_conflict`) is different: no plugin selection avoids it, so every
+    plugin that is not compatible carries the mark.
+    """
+    for entry in analysis.plugins:
+        entry["blocks_core_upgrade"] = bool(
+            analysis.core_conflict and entry.get("status") != STATUS_COMPATIBLE)
 
 
 def analyse(
@@ -167,6 +203,7 @@ def analyse(
         profile_dir=Path(profile.directory) if profile.directory else None,
         host_packages=host_packages,
         vendor=vendor,
+        core_conflict=core_conflict(current, target),
     )
     analysis.notes.append(f"host inventory: {source}, names: {len(host_packages)}")
 
@@ -243,6 +280,8 @@ def analyse(
                                 profile_dir=profile.directory)
         analysis.plugins.append(entry)
 
+    apply_core_block(analysis)
+
     local_count = len(analysis.local_plugins())
     if local_count:
         analysis.notes.append(
@@ -256,6 +295,37 @@ def analyse(
 def _resolve_local(plugin, profile_dir: Path | None):
     """The local source of a plugin (or None for npm/github)."""
     return locals_mod.resolve(getattr(plugin, "spec", None), profile_dir)
+
+
+def reason_code_for(entry: dict, *, basis: str | None = None) -> str | None:
+    """Stable identifier for the class of failure an entry reports.
+
+    Read from the finding lists rather than from the reason text, so a reworded
+    reason keeps its identifier. ``basis`` is the verdict basis of
+    :func:`dshupgrade.compat.evaluate`: a manifest that declares nothing is the
+    only unknown that names a finding of its own — an unreadable manifest is a
+    gap in the input, not a declaration.
+    """
+    candidates: list[str] = []
+    if entry.get("declaration_hits"):
+        candidates.append(codes.DECLARATION_INTEGRITY_FAILURE)
+    if entry.get("registration_hits"):
+        candidates.append(codes.DUPLICATE_FACTORY_REGISTRATION)
+    if entry.get("removed_hits"):
+        candidates.append(codes.REMOVED_PACKAGE_REQUIRED)
+    if entry.get("client_hits"):
+        candidates.append(codes.BROWSER_MODULE_TABLE_MISS)
+    if entry.get("inline_hits"):
+        candidates.append(codes.INLINE_PURITY_VIOLATION)
+    failing = {declaration.get("kind") for declaration in entry.get("declarations") or []
+               if declaration.get("result") is False}
+    if "peer" in failing:
+        candidates.append(codes.PEER_RANGE_MISMATCH)
+    if failing & {"engine", "engine-nested"}:
+        candidates.append(codes.ENGINES_DSH_MISMATCH)
+    if entry.get("status") == STATUS_UNKNOWN and basis == "undeclared":
+        candidates.append(codes.UNKNOWN_DECLARATIONS)
+    return codes.primary(candidates)
 
 
 def _analyse_plugin(plugin, analysis: Analysis, *, offline: bool, check_updates: bool,
@@ -297,6 +367,7 @@ def _analyse_plugin(plugin, analysis: Analysis, *, offline: bool, check_updates:
         "installable": not (local is not None and not local.available),
         "status": STATUS_UNKNOWN,
         "reason": "",
+        "reason_code": None,
         "requirement": None,
         "declarations": [],
         "removed_hits": [],
@@ -477,11 +548,13 @@ def _analyse_plugin(plugin, analysis: Analysis, *, offline: bool, check_updates:
                 entry["latest_status"] = latest_verdict.status
                 if latest_verdict.status == STATUS_COMPATIBLE:
                     entry["recommended"] = f"{plugin.name}@{latest}"
+
+    entry["reason_code"] = reason_code_for(entry, basis=verdict.basis)
     return entry
 
 
 def evaluate_registry_version(name: str, version: str, analysis: Analysis, *, offline: bool = False) -> str:
-    """Verdict for a specific registry package version (used to pick an update)."""
+    """Verdict for a specific registry package version (the basis for an update)."""
     manifest = _manifest_for(name, None, version, offline=offline)
     if manifest is None:
         return STATUS_UNKNOWN

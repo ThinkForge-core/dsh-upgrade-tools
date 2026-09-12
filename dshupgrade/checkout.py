@@ -162,7 +162,7 @@ def inline_classification(checkout: Path) -> tuple[str | None, str | None, str |
 
 
 def removed_packages(old_inventory: set[str], new_inventory: set[str]) -> list[str]:
-    """Packages that used to exist and are gone (the main hard-breakage signal)."""
+    """Packages present in the baseline inventory and absent from the new one."""
     return sorted(old_inventory - new_inventory)
 
 
