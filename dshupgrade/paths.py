@@ -90,6 +90,32 @@ def core_version(install_dir: Path | None = None) -> str | None:
     return None if directory is None else package_version(directory)
 
 
+def host_modules_dir(install_dir: Path | None) -> Path | None:
+    """The ``node_modules`` directory holding the installed core's packages.
+
+    Two layouts are in use, and the tool must read the same facts from both. A
+    global install keeps a package's dependencies inside the package itself
+    (``<dsh>/node_modules/@deepseek-ai``), which is what ``npm i -g`` and nvm
+    produce. A hoisted install — a project-local dependency, or an installer that
+    flattens the tree — keeps them beside the package instead
+    (``node_modules/@deepseek-ai`` next to ``.../@deepseek-ai/dsh``).
+
+    The nested directory wins when both exist: that is the tree the running core
+    resolves against. ``None`` means neither layout is present, and callers fall
+    back to their seed list rather than reporting an empty inventory as a fact.
+    """
+    if install_dir is None:
+        return None
+    install = Path(install_dir)
+    nested = install / "node_modules"
+    if (nested / "@deepseek-ai").is_dir():
+        return nested
+    parent = install.parent
+    if parent.name == "@deepseek-ai" and parent.parent.is_dir():
+        return parent.parent
+    return None
+
+
 #: Checkout locations. ``temp`` clones under the system temporary directory
 #: (see :func:`temp_checkouts_root`); ``keep`` is ``<DSH_HOME>/checkouts``; anything
 #: else is a directory the user chose, kept between runs.

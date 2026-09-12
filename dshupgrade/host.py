@@ -15,6 +15,8 @@ import json
 import re
 from pathlib import Path
 
+from .paths import host_modules_dir
+
 # Curated fallback seed: used when the core directory cannot be found.
 CURATED_HOST_SEED: tuple[str, ...] = (
     "@deepseek-ai/dsh",
@@ -45,17 +47,22 @@ _HOST_PEER_RE = re.compile(r"^@deepseek-ai/dsh(?:-|$)")
 
 
 def host_inventory(install_dir: Path | None) -> set[str]:
-    """Host package names: the contents of ``node_modules/@deepseek-ai`` of the installation."""
+    """Host package names: the contents of ``node_modules/@deepseek-ai`` of the installation.
+
+    Both install layouts are read (:func:`paths.host_modules_dir`), so a hoisted
+    tree yields the real inventory instead of silently falling back to the seed.
+    """
     names = set(CURATED_HOST_SEED)
     if install_dir is None:
         return names
-    scope = Path(install_dir) / "node_modules" / "@deepseek-ai"
-    try:
-        for entry in scope.iterdir():
-            if entry.name.startswith(("dsh", "cordis")):
-                names.add(f"@deepseek-ai/{entry.name}")
-    except OSError:
-        pass
+    modules = host_modules_dir(install_dir)
+    if modules is not None:
+        try:
+            for entry in (modules / "@deepseek-ai").iterdir():
+                if entry.name.startswith(("dsh", "cordis")):
+                    names.add(f"@deepseek-ai/{entry.name}")
+        except OSError:
+            pass
     manifest = None
     try:
         manifest = json.loads((Path(install_dir) / "package.json").read_text(encoding="utf-8"))
@@ -76,9 +83,11 @@ def installed_client_rows(install_dir: Path | None) -> set[str]:
     rows: set[str] = set()
     if install_dir is None:
         return rows
-    scope = Path(install_dir) / "node_modules" / "@deepseek-ai"
+    modules = host_modules_dir(install_dir)
+    if modules is None:
+        return rows
     try:
-        entries = sorted(scope.iterdir())
+        entries = sorted((modules / "@deepseek-ai").iterdir())
     except OSError:
         return rows
     for entry in entries:

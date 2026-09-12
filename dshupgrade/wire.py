@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .effects import client_half
-from .paths import core_install_dir, read_json
+from .paths import core_install_dir, host_modules_dir, read_json
 
 #: The call is served by the installed core.
 OK = "ok"
@@ -149,9 +149,10 @@ def core_endpoints(directory: Path | None = None) -> CoreEndpoints:
     install = Path(directory) if directory is not None else core_install_dir()
     if install is None:
         return CoreEndpoints()
-    packages = install / "node_modules" / "@deepseek-ai"
-    if not packages.is_dir():
+    modules = host_modules_dir(install)
+    if modules is None:
         return CoreEndpoints(directory=str(install))
+    packages = modules / "@deepseek-ai"
     found: set[str] = set()
     seen_files = 0
     seen_packages = 0

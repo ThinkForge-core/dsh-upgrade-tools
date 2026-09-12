@@ -52,7 +52,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .paths import core_install_dir, read_json
+from .paths import core_install_dir, host_modules_dir, read_json
 
 # --------------------------------------------------------------------------- #
 # The patch subset
@@ -267,8 +267,19 @@ def _entry_ops(block: list[str]) -> list[Op]:
 # --------------------------------------------------------------------------- #
 
 def _package_dir(name: str, profile_dir: Path, install_dir: Path | None) -> Path | None:
-    for candidate in filter(None, (profile_dir / "node_modules" / name,
-                                   (install_dir / "node_modules" / name) if install_dir else None)):
+    """The directory of a package a mounted row names.
+
+    The profile's own tree comes first (that is what the profile actually
+    resolves); the installed core's tree is the fallback, read in whichever
+    layout it uses (see :func:`paths.host_modules_dir`).
+    """
+    candidates = [profile_dir / "node_modules" / name]
+    if install_dir is not None:
+        candidates.append(Path(install_dir) / "node_modules" / name)
+        modules = host_modules_dir(install_dir)
+        if modules is not None:
+            candidates.append(modules / name)
+    for candidate in candidates:
         if (candidate / "package.json").is_file():
             return candidate
     return None
