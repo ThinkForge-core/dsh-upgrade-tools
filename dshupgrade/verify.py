@@ -913,8 +913,8 @@ _FAILURE_PATTERNS = (
 
 #: Failures the recording stub CANNOT have caused. An undeclared identifier is
 #: undeclared under any context, so ``ReferenceError: X is not defined`` is proof
-#: about the plugin — and it is exactly the shape of the case that prompted this
-#: probe (a free variable removed in a refactor, still read by a handler).
+#: about the plugin (a free variable removed in a refactor, still read by a
+#: handler — the shape this probe exists to catch).
 _STUB_IMMUNE = (
     re.compile(r"\bReferenceError\b"),
     re.compile(r"\bis not defined\b"),
@@ -963,9 +963,9 @@ def handler_failure(record: dict) -> str | None:
 
     Only stub-immune evidence counts. A ``ReferenceError`` is proof either way it
     appears: an undeclared binding is undeclared in every context, so the plugin —
-    not the probe — is broken. That is the shape of the case that prompted this
-    probe, where a free variable removed in a refactor was still read by a handler
-    that caught its own error and answered ``200 []``; nothing else could see it.
+    not the probe — is broken. A free variable removed in a refactor and still read
+    by a handler that catches its own error and answers ``200 []`` is exactly that
+    shape, and nothing else can see it.
 
     Everything else is deliberately a LEAD (:func:`handler_suspect`), with the
     evidence attached. A ``TypeError`` mid-chain is what a recording stub produces

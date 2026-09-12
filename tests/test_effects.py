@@ -241,7 +241,7 @@ class ShadowTest(unittest.TestCase):
         self.assertIn("client.js:1", found[0].evidence)
 
     def test_a_name_inside_a_localized_string_is_not_a_dependency(self):
-        # The real false positive: a Chinese hint mentioning skill-filesystem.
+        # A user-facing string that names the module is not a dependency on it.
         make_bundle(self.root, "base",
                     "- insert:\n    - id: skill-filesystem\n"
                     "      name: '@deepseek-ai/dsh-skill-filesystem'\n"
