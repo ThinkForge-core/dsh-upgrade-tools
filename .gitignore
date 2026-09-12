@@ -1,0 +1,14 @@
+# State and cache: local machine data, not part of the tool
+state/
+__pycache__/
+*.pyc
+
+# pytest cache
+.pytest_cache/
+
+# Local virtualenvs and build artifacts
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
