@@ -77,9 +77,23 @@ def _is_module_specifier(specifier: str) -> bool:
 STATUS_COMPATIBLE = "compatible"
 STATUS_INCOMPATIBLE = "incompatible"
 STATUS_UNKNOWN = "unknown"
+#: Nothing proven wrong AND the installed copy was proven at runtime on the target
+#: core. The declaration checks and the runtime probe answer different questions, so
+#: this is a stronger statement than :data:`STATUS_COMPATIBLE`: the code was seen to
+#: import, apply and answer a request in the deployment it is being judged for.
+STATUS_VERIFIED = "verified"
 
 # Outcomes that the market treats as a definite incompatibility.
 DEFINITE_FAILURES = ("below-min", "above-explicit-max", "exact-pin")
+
+
+def accepted(status: str | None) -> bool:
+    """True when a status means "nothing proven wrong" — safe to install.
+
+    Everything that holds a plugin back (a proven incompatibility, a manifest that
+    could not be read, an artifact that is missing) is *not* accepted.
+    """
+    return status in (STATUS_COMPATIBLE, STATUS_VERIFIED)
 
 
 @dataclass

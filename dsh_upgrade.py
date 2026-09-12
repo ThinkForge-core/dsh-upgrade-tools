@@ -50,6 +50,8 @@ from dshupgrade.compat import (  # noqa: E402
     STATUS_COMPATIBLE,
     STATUS_INCOMPATIBLE,
     STATUS_UNKNOWN,
+    STATUS_VERIFIED,
+    accepted,
     declarations_for,
     evaluate,
     scan_client_modules,
@@ -93,6 +95,34 @@ def load_profile(args):
     return read_profile(directory)
 
 
+def target_problem(target: str, *, offline: bool = False) -> str | None:
+    """Why ``target`` cannot be a check target — or ``None`` when it can.
+
+    A compatibility check compares a plugin against a version, so the version has to
+    be one the tool can actually obtain: the installed core, a checkout already on
+    disk, or a version the registry publishes. Anything else is not a hard version
+    to compare with — every declaration would come back "unconfirmed" for lack of
+    anything to compare against, which reads like a result and is not one.
+    """
+    if semver.parse_version(target) is None:
+        return f"'{target}' is not a version number"
+    if core_version() == target or paths.find_checkout(target) is not None:
+        return None
+    try:
+        published = {item["version"]
+                     for item in registry.core_versions(offline=offline)["versions"]}
+    except (RuntimeError, OSError, ValueError):
+        published = set()
+    if target in published:
+        return None
+    if published:
+        newest = registry.newest_core_version(offline=offline)
+        return (f"no such core version: {target} (the registry publishes "
+                f"{len(published)} versions, newest {newest or '—'})")
+    return (f"cannot confirm {target}: the registry is unreachable and it is neither "
+            "the installed core nor a checkout on disk")
+
+
 def resolve_target(args) -> str:
     """Target core version: from --core, otherwise the NEWEST published version.
 
@@ -102,6 +132,10 @@ def resolve_target(args) -> str:
     reached at all; ``plan`` lists every candidate if another version is wanted.
     """
     if args.core:
+        problem = target_problem(args.core, offline=getattr(args, "offline", False))
+        if problem:
+            raise SystemExit(f"{problem}; pass a published core version, or drop --core "
+                             "to use the newest one")
         return args.core
     newest = registry.newest_core_version(offline=getattr(args, "offline", False))
     if newest is not None:
@@ -118,14 +152,71 @@ def resolve_target(args) -> str:
 
 def analyse_for(args, profile, target: str):
     log_to = _log_stream(args)
-    return analysis_mod.analyse(
+    result = analysis_mod.analyse(
         profile,
         target,
         offline=args.offline,
         allow_clone=not args.no_clone,
-        check_updates=getattr(args, "update", False),
+        check_updates=bool(getattr(args, "update", False)),
         log=lambda text: print(style.dim(f"  {text}"), file=log_to),
     )
+    _mark_verified(result, profile)
+    return result
+
+
+def _mark_verified(result, profile) -> None:
+    """Grade the entries a previous runtime probe has proven on this core.
+
+    The verdict is taken from the verify cache and nothing is executed here: the
+    cache is keyed by a fingerprint that covers the core and every installed copy, so
+    a verdict taken before any of them changed is not reused. A plugin is graded only
+    when the whole picture is clean — the probe saw it import, apply and answer, the
+    declaration and code checks found nothing, its client half does not draw into a
+    switched-off row, and none of its calls addresses an endpoint this core does not
+    serve. Runtime evidence is evidence about ONE core, so it is applied only when the
+    target IS the installed core.
+    """
+    if result.current_core is None or result.current_core != result.target:
+        return
+    probes = verify_mod.load_cache(profile, result.current_core)
+    if not probes:
+        return
+    proven = {name for name, probe in probes.items() if verify_mod.runtime_verified(probe)}
+    if not proven:
+        return
+    _, shadows, _ = profile_surfaces(profile, probes)
+    wire = wire_surfaces(profile)
+    clean = set()
+    for plugin in result.plugins:
+        name = plugin["name"]
+        if name not in proven:
+            continue
+        if wire.get(name):
+            continue
+        if any(not shadow.explained for shadow in shadows.get(name, [])):
+            continue
+        clean.add(name)
+    analysis_mod.apply_runtime_verification(result, clean)
+
+
+def _selection(args, profile, *, what: str) -> list[str]:
+    """The plugins named by ``--only``, in profile order — or every plugin.
+
+    A name the profile does not have is an input error, not a silent no-op: the
+    caller asked for a plugin that is not here, and proceeding would report success
+    for an operation that never happened.
+    """
+    names = list(getattr(args, "only", None) or [])
+    if not names:
+        return [plugin.name for plugin in profile.plugins]
+    known = {plugin.name for plugin in profile.plugins}
+    missing = sorted({name for name in names if name not in known})
+    if missing:
+        raise SystemExit(
+            f"not in profile {profile.name}: {', '.join(missing)} (--only {what}); "
+            "installed plugins: " + (", ".join(sorted(known)) or "none"))
+    wanted = set(names)
+    return [plugin.name for plugin in profile.plugins if plugin.name in wanted]
 
 
 def _quiet(args) -> bool:
@@ -158,9 +249,14 @@ def _report_console(args):
 
 
 def summary_payload(*, total: int, incompatible: int, unknown: int, wire_dead: int,
-                    handler_failures: int, exit_code: int) -> dict:
-    """The one-line summary as data, with the code the command returns."""
-    return {
+                    handler_failures: int, exit_code: int, verified: int | None = None) -> dict:
+    """The one-line summary as data, with the code the command returns.
+
+    ``verified`` is reported by the commands that judge compatibility against the
+    installed core, where the runtime probe can grade a plugin; the commands that
+    report on the probe itself leave it out.
+    """
+    payload = {
         "total": total,
         "incompatible": incompatible,
         "unknown": unknown,
@@ -168,14 +264,20 @@ def summary_payload(*, total: int, incompatible: int, unknown: int, wire_dead: i
         "handler_failures": handler_failures,
         "exit_code": exit_code,
     }
+    if verified is not None:
+        payload["verified"] = verified
+    return payload
 
 
 def summary_line(payload: dict) -> str:
     """The summary as the one line it is meant to be."""
-    return (f"{payload['total']} plugins checked, "
+    line = (f"{payload['total']} plugins checked, "
             f"{payload['incompatible']} incompatible, "
-            f"{payload['unknown']} unknown, "
-            f"{payload['wire_dead']} wire-dead, "
+            f"{payload['unknown']} unknown, ")
+    if payload.get("verified") is not None:
+        line += f"{payload['verified']} verified, "
+    return (line
+            + f"{payload['wire_dead']} wire-dead, "
             f"{payload['handler_failures']} handler-failures")
 
 
@@ -281,7 +383,7 @@ def cmd_plan(args) -> int:
             continue
         counts = result.counts()
         bad = [plugin["name"] for plugin in result.plugins
-               if plugin["status"] != STATUS_COMPATIBLE]
+               if not accepted(plugin["status"])]
         row = [
             version,
             item.get("time") or "",
@@ -1105,7 +1207,7 @@ def cmd_check(args) -> int:
     # and "unconfirmed" entries belong in it too. The exit code stays 2 for "NO"
     # only.
     entries = [analysis_mod.incompatible_entry(plugin) for plugin in result.plugins
-               if plugin["status"] != STATUS_COMPATIBLE]
+               if not accepted(plugin["status"])]
     json_path, md_path = snapshot.write_incompatible(target, entries, note="check")
     paths["incompatible"] = str(json_path)
     paths["markdown"] = str(md_path)
@@ -1115,7 +1217,8 @@ def cmd_check(args) -> int:
             total=len(result.plugins),
             incompatible=counts.get(STATUS_INCOMPATIBLE, 0),
             unknown=counts.get(STATUS_UNKNOWN, 0),
-            wire_dead=0, handler_failures=0, exit_code=exit_code), args)
+            wire_dead=0, handler_failures=0, exit_code=exit_code,
+            verified=counts.get(STATUS_VERIFIED, 0)), args)
         return exit_code
 
     if json_mode:
@@ -1200,6 +1303,10 @@ def cmd_inspect(args) -> int:
     target = args.core or installed
     if target is None:
         raise SystemExit("could not determine the core version: pass --core")
+    problem = target_problem(target, offline=args.offline)
+    if problem:
+        raise SystemExit(f"{problem}; pass a published core version, or drop --core to judge "
+                         "the artifact against the installed one")
 
     baseline = args.since or installed
     # ``--json`` makes stdout a single JSON document, so the progress log of the
@@ -1283,7 +1390,7 @@ def cmd_inspect(args) -> int:
 
 def cmd_detach(args) -> int:
     profile = load_profile(args)
-    names = [entry.name for entry in profile.plugins]
+    names = _selection(args, profile, what="detach")
     if not names:
         print(style.dim("No plugins are recorded in the profile — nothing to detach"))
         return 0
@@ -1398,7 +1505,7 @@ def _partition(entries: list[dict], result, *, offline: bool):
                 "requirement": verdict.requirement,
                 "manifest": manifest,
             }
-        if record["status"] == STATUS_COMPATIBLE:
+        if accepted(record["status"]):
             ready.append({**record, "install": record["spec"]})
         else:
             blocked.append(record)
@@ -1426,7 +1533,8 @@ def _promote_unknown(ready: list[dict], blocked: list[dict]):
     return ready + promoted, remaining, promoted
 
 
-def _install_specs(ready: list[dict], result, *, update: bool, offline: bool) -> list[str]:
+def _install_specs(ready: list[dict], result, *, update: bool, offline: bool,
+                   pinned: dict[str, str] | None = None) -> list[str]:
     """Specifiers to install.
 
     npm packages are installed at an EXACT version rather than at the recorded
@@ -1434,15 +1542,21 @@ def _install_specs(ready: list[dict], result, *, update: bool, offline: bool) ->
     reinstallation, and that one may require a different core (a newer release can
     raise its own minimum core). ``--update`` raises the version
     upwards only, and only when the new version passes the compatibility check.
+
+    ``pinned`` carries decisions already taken while the update was selected: those
+    plugins are installed at the version that was checked instead of being recomputed
+    here, so the plan the reader approved and the artifact that gets installed cannot
+    disagree.
     """
+    pinned = pinned or {}
     specs = []
     for item in ready:
         name = item["name"]
         recorded = item.get("spec") or name
         version = item.get("version")
         if item.get("source") == "npm":
-            chosen = None
-            if update:
+            chosen = pinned.get(name)
+            if chosen is None and update:
                 chosen = analysis_mod.best_compatible_version(
                     name, result, offline=offline, minimum=version
                 )
@@ -1455,6 +1569,164 @@ def _install_specs(ready: list[dict], result, *, update: bool, offline: bool) ->
         item["install"] = spec
         specs.append(spec)
     return specs
+
+
+def _is_newer(candidate: str | None, base: str | None) -> bool:
+    """Strict semver upgrade test: false when either side is not a version."""
+    if not candidate or not base:
+        return False
+    if semver.parse_version(candidate) is None or semver.parse_version(base) is None:
+        return False
+    return semver.compare_version(candidate, base) > 0
+
+
+def _update_candidate(item: dict, result, *, offline: bool):
+    """The version this plugin could be updated to, and whether it is confirmed.
+
+    Returns ``(version, confirmed)`` or ``None`` when there is no update. Two kinds of
+    update are told apart:
+
+    * **confirmed** — the newest version that evaluates ``compatible`` on this core,
+      which is exactly the version the install list would use;
+    * **not confirmed** — a newer version exists, but nothing proves it compatible
+      here; installing it is a deliberate choice.
+
+    A version the code checks proved INCOMPATIBLE is never a candidate: no flag
+    installs it. Only an npm source can have an update — a local or git source is
+    reinstalled from its own specifier and is never compared with a registry version,
+    so no update can be established for it.
+    """
+    name = item.get("name")
+    if not name or item.get("source") != "npm":
+        return None
+    installed = item.get("version")
+    confirmed = analysis_mod.best_compatible_version(
+        name, result, offline=offline, minimum=installed)
+    if _is_newer(confirmed, installed):
+        return confirmed, True
+    latest = item.get("latest")
+    if _is_newer(latest, installed) and item.get("latest_status") != STATUS_INCOMPATIBLE:
+        return latest, False
+    return None
+
+
+def _update_skip_reason(item: dict, *, offline: bool) -> str:
+    """Why a plugin has nothing to update to — phrased for the reader of the report."""
+    source = item.get("source")
+    if source != "npm":
+        if source:
+            return (f"a {source} source — reinstalled from its own specifier, so there is "
+                    "no registry version to compare")
+        return "no source recorded — nothing to compare"
+    if offline:
+        return "the registry was not queried (--offline)"
+    return "no newer version is published"
+
+
+def _update_plan(names: list[str], result, *, offline: bool, allow_unconfirmed: bool):
+    """Split a selection into what gets updated, what is held back and what has none.
+
+    Returns ``(updating, held, untouched)``. ``updating`` is a list of
+    ``(name, version, confirmed)`` for the plugins that will actually be installed at a
+    new version; ``held`` are the plugins a newer version exists for but that is not
+    installable — unconfirmed without the opt-in, or proven incompatible; ``untouched``
+    are the ones with nothing newer at all. Every name lands in exactly one list, and
+    the reasons travel with them, so the report is auditable rather than a silent
+    narrowing.
+    """
+    by_name = {plugin["name"]: plugin for plugin in result.plugins}
+    updating: list[tuple[str, str, bool]] = []
+    held: list[dict] = []
+    untouched: list[tuple[str, str | None, str]] = []
+    for name in names:
+        item = by_name.get(name)
+        if item is None:
+            untouched.append((name, None, "not part of the compatibility analysis"))
+            continue
+        installed = item.get("version")
+        candidate = _update_candidate(item, result, offline=offline) \
+            if item.get("source") == "npm" else None
+        if candidate is None:
+            latest = item.get("latest")
+            if item.get("source") == "npm" and _is_newer(latest, installed):
+                held.append({
+                    "name": name, "installed": installed, "latest": latest,
+                    "installable": False,
+                    "reason": f"{latest} is published but proven incompatible with this core",
+                })
+            else:
+                untouched.append((name, installed,
+                                  _update_skip_reason(item, offline=offline)))
+            continue
+        version, confirmed = candidate
+        if confirmed or allow_unconfirmed:
+            updating.append((name, version, confirmed))
+        else:
+            held.append({
+                "name": name, "installed": installed, "latest": version,
+                "installable": True,
+                "reason": f"{version} is published but not confirmed for this core",
+            })
+    return updating, held, untouched
+
+
+def _apply_pins(ready: list[dict], blocked: list[dict], pins: dict[str, str]):
+    """Move the plugins with a chosen update into the install list at that version.
+
+    The version being INSTALLED is what was checked, not the copy that is there right
+    now: a plugin whose installed copy is undeclared can still have a checked update,
+    and judging that one by the old copy would hold it back instead of upgrading it.
+    Everything that is not pinned keeps its own verdict.
+    """
+    if not pins:
+        return ready, blocked
+    kept_ready: list[dict] = []
+    kept_blocked: list[dict] = []
+
+    def move(items: list[dict], keep: list[dict]) -> None:
+        for item in items:
+            pinned = pins.get(item.get("name"))
+            if pinned is None:
+                keep.append(item)
+                continue
+            item["install"] = f"{item['name']}@{pinned}"
+            item["updated_to"] = pinned
+            kept_ready.append(item)
+
+    move(ready, kept_ready)
+    move(blocked, kept_blocked)
+    return kept_ready, kept_blocked
+
+
+def _print_update_plan(updating: list[tuple[str, str, bool]], held: list[dict],
+                       untouched: list[tuple[str, str | None, str]], *,
+                       install_unknown: bool) -> None:
+    """The update decision, plugin by plugin."""
+    print()
+    print(style.heading(f"=== To update ({len(updating)}) ==="))
+    for name, version, confirmed in updating:
+        note = ""
+        if not confirmed:
+            note = style.warn("  not confirmed for this core — installed because of "
+                              "--install-unknown, checked afterwards")
+        print(f"    {style.good('↑')} {name} → {style.subheading(version)}{note}")
+    if not updating:
+        print(style.dim("    none"))
+    if held:
+        print()
+        print(style.heading(f"=== Held back — a newer version exists ({len(held)}) ==="))
+        for item in held:
+            line = (f"    · {item['name']} {item['installed'] or '—'} → {item['latest']}: "
+                    f"{item['reason']}")
+            if item["installable"] and not install_unknown:
+                line += (style.dim(" — pass --install-unknown to install it anyway, with a "
+                                   "post-install code check"))
+            print(line)
+    if untouched:
+        print()
+        print(style.heading(f"=== Left alone — nothing to update ({len(untouched)}) ==="))
+        for name, version, reason in untouched:
+            print(f"    · {name} {style.dim(version or '—')}: {reason}")
 
 
 def cmd_attach(args) -> int:
@@ -1616,16 +1888,82 @@ def cmd_recheck(args) -> int:
 
 
 def cmd_plugins(args) -> int:
-    """Update plugins only, leaving the core alone."""
+    """Update the plugins that have a newer version, leaving the core alone.
+
+    Only the plugins with an update are touched. A plugin with nothing newer is not
+    detached, not reinstalled and not re-versioned — a run can therefore never leave
+    one out of the profile — and the report names every one of them with the reason.
+    Reinstalling the profile as a whole is what ``detach`` followed by ``attach`` is
+    for.
+
+    ``--only NAME…`` narrows the operation to the named plugins. The snapshot still
+    records the WHOLE profile — a snapshot describes a state, not an operation.
+
+    A newer version that evaluates ``compatible`` on this core is installed. A newer
+    version that is merely unconfirmed — nothing declared to compare with, or not
+    admitted by the declarations — is held back and reported, unless
+    ``--install-unknown`` is given: that opt-in installs it and judges it afterwards
+    by the post-install code check. A version the code checks proved incompatible is
+    never installed, with or without the flag.
+
+    ``--detach-first`` removes each plugin before installing its new version. By
+    default the new version is installed over the current copy, which is what ``dsh``
+    itself does and what keeps a failed install from leaving the plugin missing.
+    """
     profile = load_profile(args)
     target = core_version()
     if target is None:
         raise SystemExit("installed core not found — install or pass a core first")
+    names = _selection(args, profile, what="plugins")
+    if not names:
+        print(style.dim("No plugins are recorded in the profile — nothing to update"))
+        return 0
+    install_unknown = bool(getattr(args, "install_unknown", False))
+    detach_first = bool(getattr(args, "detach_first", False))
+    # Selecting an update means comparing versions, so the registry is always consulted.
+    args.update = True
 
     print()
     print(style.heading(f"=== Updating plugins only, on the current core {target} ==="))
+    if len(names) != len(profile.plugins):
+        print(f"  selected: {style.subheading(len(names))} of {len(profile.plugins)} plugins — "
+              + ", ".join(names))
     result = analyse_for(args, profile, target)
     report.print_analysis(result, verbose=args.verbose)
+
+    updating, held, untouched = _update_plan(
+        names, result, offline=args.offline, allow_unconfirmed=install_unknown)
+    _print_update_plan(updating, held, untouched, install_unknown=install_unknown)
+    if not updating:
+        print()
+        print(style.dim("  Nothing to update — the profile is left as it is"))
+        return 0
+
+    # The plan is computed before the confirmation so that what is approved is what
+    # runs: the dry run, the prompt and the operation see the same list.
+    pins = {name: version for name, version, _ in updating}
+    selected = set(pins)
+    entries = [entry for entry in analysis_mod.snapshot_entries(profile)
+               if entry.get("name") in selected]
+    ready, blocked = _partition(entries, result, offline=args.offline)
+    ready, blocked = _apply_pins(ready, blocked, pins)
+    for item in blocked:
+        # Every selected plugin has a version that was checked, so this is a safeguard
+        # rather than a normal outcome.
+        print(report.warning(f"{item['name']}: no installable version ({item.get('reason')}) "
+                             "— it is left as it is"))
+    specs = _install_specs(ready, result, update=True, offline=args.offline, pinned=pins)
+
+    print()
+    print(style.heading(f"=== To install ({len(specs)}) ==="))
+    for spec in specs:
+        print(f"    {style.good('+')} {spec}")
+    print()
+    print(style.dim("  installing in place — only the listed plugins change, and the current "
+                    "copy is replaced only when the new version installs successfully"
+                    if not detach_first else
+                    "  detaching each plugin before installing its new version "
+                    "(--detach-first)"))
 
     if args.dry_run:
         print()
@@ -1633,28 +1971,30 @@ def cmd_plugins(args) -> int:
         return 0
     if not args.yes:
         print()
-        print(style.warn("  Repeat with --yes: the plugins will be detached and installed again."))
+        print(style.warn(f"  Repeat with --yes: {len(pins)} plugin(s) will be installed at a "
+                         "newer version."))
         return 1
 
     data = snapshot.write_snapshot(profile, target, analysis_mod.snapshot_entries(profile),
                                    note="plugins-only")
     print()
     print(f"  snapshot: {_path_row(data['_jsonPath'])}")
-    names = [plugin.name for plugin in profile.plugins]
-    remove_plugins(profile, names, log=lambda text: print(style.dim(f"  {text}")))
+    if detach_first:
+        remove_plugins(profile, [name for name, _, _ in updating],
+                       log=lambda text: print(style.dim(f"  {text}")))
+    add_plugins(profile, specs, log=lambda text: print(style.dim(f"  {text}")))
 
     fresh = read_profile(profile.directory)
-    ready, blocked = _partition(data["plugins"], result, offline=args.offline)
-    specs = _install_specs(ready, result, update=args.update, offline=args.offline)
-    add_plugins(fresh, specs, log=lambda text: print(style.dim(f"  {text}")))
-
+    # The list is rebuilt from the post-check over the WHOLE profile, so a narrowed
+    # run cannot leave the list describing only the plugins it touched. Entries that
+    # never made it into the profile stay in it: the post-check cannot see them.
     verify = analyse_for(args, fresh, target)
-    failed = [plugin for plugin in verify.plugins if plugin["status"] == STATUS_INCOMPATIBLE]
+    entries_out = {item["name"]: item for item in blocked}
+    for plugin in verify.plugins:
+        if not accepted(plugin["status"]):
+            entries_out[plugin["name"]] = analysis_mod.incompatible_entry(plugin)
     json_path, md_path = snapshot.write_incompatible(
-        target,
-        blocked + [analysis_mod.incompatible_entry(plugin) for plugin in failed],
-        note="plugins-only",
-    )
+        target, list(entries_out.values()), note="plugins-only")
     print()
     print(f"  incompatible list: {_path_row(json_path)}")
     print(f"  human readable:    {_path_row(md_path)}")
@@ -1676,7 +2016,7 @@ def cmd_pipeline(args) -> int:
     head(f"Checking compatibility with core {target}")
     result = analyse_for(args, profile, target)
     report.print_analysis(result, verbose=args.verbose)
-    blocked_preview = [p for p in result.plugins if p["status"] != STATUS_COMPATIBLE]
+    blocked_preview = [p for p in result.plugins if not accepted(p["status"])]
     if blocked_preview:
         if args.install_unknown:
             print(report.warning(
@@ -1897,13 +2237,17 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.set_defaults(func=cmd_inspect)
 
     detach = add("detach", "snapshot and detach all plugins")
+    detach.add_argument("--only", nargs="+", metavar="NAME",
+                        help="detach only the listed plugins; the snapshot still records the "
+                             "whole profile")
     detach.add_argument("--yes", action="store_true", help="confirm the operation")
     detach.add_argument("--dry-run", action="store_true", help="only show the plan")
     detach.set_defaults(func=cmd_detach)
 
     attach = add("attach", "install the compatible plugins from a snapshot")
     attach.add_argument("--from", dest="from_file", help="snapshot file (the freshest one by default)")
-    attach.add_argument("--only", nargs="+", help="only the listed plugins")
+    attach.add_argument("--only", nargs="+", metavar="NAME",
+                        help="restore only the listed plugins from the snapshot")
     attach.add_argument("--update", action="store_true", help="install the newest compatible version")
     attach.add_argument("--install-unknown", action="store_true",
                         help="also install unconfirmed (undeclared) plugins — with a post-install code check")
@@ -1925,8 +2269,19 @@ def build_parser() -> argparse.ArgumentParser:
     recheck.add_argument("--dry-run", action="store_true")
     recheck.set_defaults(func=cmd_recheck)
 
-    plugins = add("plugins", "update plugins only, on the current core")
-    plugins.add_argument("--update", action="store_true", help="install the newest compatible version")
+    plugins = add("plugins", "update the plugins that have a newer version")
+    plugins.add_argument("--only", nargs="+", metavar="NAME",
+                         help="update only the listed plugins; the rest of the profile is "
+                              "left untouched")
+    plugins.add_argument("--update", action="store_true",
+                         help="install the newest compatible version — always on for this "
+                              "command, accepted for symmetry with the others")
+    plugins.add_argument("--install-unknown", action="store_true",
+                         help="also install a newer version that is not confirmed for this "
+                              "core — with a post-install code check")
+    plugins.add_argument("--detach-first", dest="detach_first", action="store_true",
+                         help="remove each plugin before installing its new version; by "
+                              "default the new version is installed over the current copy")
     plugins.add_argument("--yes", action="store_true")
     plugins.add_argument("--dry-run", action="store_true")
     plugins.set_defaults(func=cmd_plugins)

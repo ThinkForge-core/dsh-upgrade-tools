@@ -588,6 +588,10 @@ def blank_line_strings(line: str) -> str:
     loader``) would otherwise open a "string" that swallows everything after it —
     and the comment on line 5 is precisely the evidence worth finding.
     """
+    # Most lines carry no literal at all, and the caller walks megabytes of code:
+    # the scan over the characters is only worth starting when there is a quote.
+    if "'" not in line and '"' not in line and "`" not in line:
+        return line
     out: list[str] = []
     quote: str | None = None
     escaped = False
@@ -616,18 +620,38 @@ def _is_comment_line(stripped: str) -> bool:
     return stripped.startswith(("//", "/*", "*"))
 
 
-def _evidence_line(text: str, token: str, folder: str) -> str:
-    """The first line of the client bundle that names the token."""
-    pattern = re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(token) + r"(?![A-Za-z0-9_-])")
+def _snippet(stripped: str) -> str:
+    """The evidence text of one line, clipped to something a terminal can hold."""
+    snippet = " ".join(stripped.split())
+    return snippet[:93] + "…" if len(snippet) > 96 else snippet
+
+
+def _evidence_lines(text: str, tokens, folder: str) -> dict[str, str]:
+    """First line naming each token, found in ONE walk over the client bundle.
+
+    A bundle is a file of source and the scan asks about a whole loader layer's
+    worth of names, so the lines are split and de-quoted once and every candidate is
+    tested during the same walk. A plain substring test runs first and the boundary
+    pattern only after it, which keeps the regex count near zero on the lines that
+    cannot match anyway.
+    """
+    wanted = set(tokens)
+    patterns = {
+        token: re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(token) + r"(?![A-Za-z0-9_-])")
+        for token in wanted
+    }
+    found: dict[str, str] = {}
     for number, line in enumerate(text.splitlines(), start=1):
         stripped = line.strip()
         haystack = line if _is_comment_line(stripped) else blank_line_strings(line)
-        if pattern.search(haystack):
-            snippet = " ".join(stripped.split())
-            if len(snippet) > 96:
-                snippet = snippet[:93] + "…"
-            return f"{folder}:{number}: {snippet}"
-    return ""
+        for token in list(wanted):
+            if token not in haystack or not patterns[token].search(haystack):
+                continue
+            found[token] = f"{folder}:{number}: {_snippet(stripped)}"
+            wanted.discard(token)
+        if not wanted:
+            break
+    return found
 
 
 def is_replacer(plugin, effective: Effective, row: Row) -> bool:
@@ -680,25 +704,35 @@ def shadows_for(plugin, effective: Effective, *, route_count: int = 0,
         return []
     folder = half.entry.name if half.entry else "client.js"
 
-    found: list[Shadow] = []
+    # Both the row id and the module's own name are worth looking for; the module
+    # specifier is the stronger of the two. A name the bundle does not contain at
+    # all is dropped before the walk — the walk is the expensive part.
+    candidates: list[tuple[Row, str]] = []
     seen: set[str] = set()
-    # Both the row id and the module's own name are worth looking for; the
-    # module specifier is the stronger of the two.
     for row in effective.disabled():
         if is_replacer(plugin, effective, row):
             continue
         for token in (row.id, row.name, row.name.rsplit("/", 1)[-1]):
             if not token or token in seen or len(token) < 4:
                 continue
-            evidence = _evidence_line(half.text, token, folder)
-            if not evidence:
-                continue
-            seen.add(token)
-            found.append(Shadow(plugin.name, token, row, evidence, route_count,
-                                kind=REFERENCE,
-                                replaced_by=replacement_for(plugin, effective, half, row,
-                                                            profile_dir)))
-            break
+            seen.add(token)          # the same name always yields the same evidence line
+            if token in half.text:
+                candidates.append((row, token))
+    if not candidates:
+        return []
+
+    evidence = _evidence_lines(half.text, [token for _, token in candidates], folder)
+    found: list[Shadow] = []
+    reported: set[int] = set()
+    for row, token in candidates:
+        line = evidence.get(token)
+        if not line or id(row) in reported:
+            continue
+        reported.add(id(row))        # one finding per disabled row, as the walk order asks
+        found.append(Shadow(plugin.name, token, row, line, route_count,
+                            kind=REFERENCE,
+                            replaced_by=replacement_for(plugin, effective, half, row,
+                                                        profile_dir)))
     return found
 
 

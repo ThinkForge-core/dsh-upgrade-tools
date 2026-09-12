@@ -28,9 +28,11 @@ from .compat import (
     STATUS_COMPATIBLE,
     STATUS_INCOMPATIBLE,
     STATUS_UNKNOWN,
+    STATUS_VERIFIED,
     BUILTIN_PLATFORM_MODULES,
     CodeSource,
     InlinePolicy,
+    accepted,
     compile_classification,
     declarations_for,
     evaluate,
@@ -63,11 +65,16 @@ class Analysis:
     session_format: int | None = None
     #: Why the target version itself is out of the tool's reach, when it is.
     core_conflict: str | None = None
+    #: Whether the registry was queried for newer plugin versions (``--update``).
+    #: Without it the ``latest`` column is empty for lack of data, not because
+    #: every plugin is current, and the report has to say which of the two it is.
+    checked_updates: bool = False
     plugins: list[dict] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
-        result = {STATUS_COMPATIBLE: 0, STATUS_INCOMPATIBLE: 0, STATUS_UNKNOWN: 0}
+        result = {STATUS_COMPATIBLE: 0, STATUS_INCOMPATIBLE: 0, STATUS_UNKNOWN: 0,
+                  STATUS_VERIFIED: 0}
         for plugin in self.plugins:
             result[plugin["status"]] = result.get(plugin["status"], 0) + 1
         return result
@@ -128,7 +135,41 @@ def apply_core_block(analysis: Analysis) -> None:
     """
     for entry in analysis.plugins:
         entry["blocks_core_upgrade"] = bool(
-            analysis.core_conflict and entry.get("status") != STATUS_COMPATIBLE)
+            analysis.core_conflict and not accepted(entry.get("status")))
+
+
+def apply_runtime_verification(analysis: Analysis, verified) -> list[dict]:
+    """Grade the entries whose installed copy was proven at runtime.
+
+    A runtime verdict is evidence about ONE core version, so the caller passes the
+    names only when the probed core is the target of this analysis; for any other
+    target the set is empty.
+
+    The upgrade never hides a finding: a proven incompatibility keeps its verdict, and
+    an unconfirmed entry is graded only when its code checks actually ran and came back
+    clean — "nothing declared" alone is not evidence. An input gap (a manifest that
+    could not be read, a local artifact that is gone) leaves the entry unconfirmed too.
+    """
+    graded = []
+    for entry in analysis.plugins:
+        if entry["name"] not in verified:
+            continue
+        if entry.get("status") == STATUS_INCOMPATIBLE:
+            continue
+        if entry.get("status") == STATUS_UNKNOWN and not entry.get("code_clean"):
+            continue
+        previous = entry["status"]
+        entry["declared_status"] = previous
+        entry["status"] = STATUS_VERIFIED
+        entry["runtime"] = "verified"
+        if not entry.get("reason"):
+            entry["reason"] = "verified at runtime on this core"
+        elif previous == STATUS_UNKNOWN:
+            entry["reason"] = "declares no DSH version; verified at runtime on this core"
+        # Anything else keeps its reason: an empirical verdict names the stricter
+        # declaration it overrode, and that fact must survive the upgrade.
+        graded.append(entry)
+    return graded
 
 
 def analyse(
@@ -204,6 +245,7 @@ def analyse(
         host_packages=host_packages,
         vendor=vendor,
         core_conflict=core_conflict(current, target),
+        checked_updates=check_updates,
     )
     analysis.notes.append(f"host inventory: {source}, names: {len(host_packages)}")
 

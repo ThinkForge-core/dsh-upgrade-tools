@@ -95,6 +95,54 @@ class ResolveTargetTest(unittest.TestCase):
                 dsh_upgrade.resolve_target(args_for())
 
 
+class TargetProblemTest(unittest.TestCase):
+    """A target has to be a version the tool can actually measure against.
+
+    Reporting every plugin as "unconfirmed" because the target does not exist reads
+    like a result and is not one, so such a target is refused instead.
+    """
+
+    def problem(self, target, *, installed=None, checkout=None, published=(),
+                unreachable=False):
+        versions = mock.Mock(side_effect=RuntimeError("offline")) if unreachable else \
+            mock.Mock(return_value=documents(*published))
+        with mock.patch.object(dsh_upgrade, "core_version", return_value=installed), \
+             mock.patch.object(dsh_upgrade.paths, "find_checkout", return_value=checkout), \
+             mock.patch.object(dsh_upgrade.registry, "core_versions", versions), \
+             mock.patch.object(dsh_upgrade.registry, "newest_core_version",
+                               return_value=(published[-1] if published else None)):
+            return dsh_upgrade.target_problem(target)
+
+    def test_a_version_shaped_string_is_required(self):
+        self.assertIn("not a version number", self.problem("y", published=("0.1.5-rc.2",)))
+
+    def test_the_installed_core_is_always_usable(self):
+        self.assertIsNone(self.problem("0.1.5-rc.2", installed="0.1.5-rc.2"))
+
+    def test_a_checkout_on_disk_is_usable(self):
+        self.assertIsNone(self.problem("0.1.5-rc.2", checkout=Path("/c")))
+
+    def test_a_published_version_is_usable(self):
+        self.assertIsNone(self.problem("0.1.4", published=("0.1.4", "0.1.5-rc.2")))
+
+    def test_a_version_nobody_published_is_refused(self):
+        message = self.problem("9.9.9", published=("0.1.4", "0.1.5-rc.2"))
+        self.assertIn("no such core version", message)
+        self.assertIn("0.1.5-rc.2", message)
+
+    def test_an_unreachable_registry_without_a_local_copy_is_refused(self):
+        message = self.problem("0.1.4", unreachable=True)
+        self.assertIn("cannot confirm", message)
+
+    def test_resolve_target_refuses_a_bogus_core(self):
+        with mock.patch.object(dsh_upgrade.paths, "find_checkout", return_value=None), \
+             mock.patch.object(dsh_upgrade.registry, "core_versions",
+                               return_value=documents("0.1.5-rc.2")):
+            with self.assertRaises(SystemExit) as caught:
+                dsh_upgrade.resolve_target(args_for(core="y"))
+        self.assertIn("not a version number", str(caught.exception))
+
+
 class SettingsTargetLabelTest(unittest.TestCase):
     """The menu header shows `auto — <version>` instead of the installed one."""
 

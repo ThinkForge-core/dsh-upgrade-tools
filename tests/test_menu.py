@@ -215,8 +215,9 @@ class MenuDispatchTest(unittest.TestCase):
         menu, _ = make_menu("1\n\n0\n", recorder)
         menu.run()
         self.assertEqual(recorder.calls[0].command, "status")
-        # The menu is the human path: item 1 fills the "loads" column itself.
-        self.assertTrue(recorder.calls[0].verify)
+        # Item 1 is the overview and must stay cheap: it reports the verdicts a
+        # previous verify cached and never runs the probe itself (item 14 does).
+        self.assertFalse(recorder.calls[0].verify)
 
     def test_verify_item(self):
         """Item 14 runs the runtime verification (it once failed with a dispatch gap)."""
@@ -404,21 +405,34 @@ class MenuSafetyTest(unittest.TestCase):
 
     def test_detach_runs_after_confirmation(self):
         recorder = Recorder()
-        menu, _ = make_menu("5\nyes\n\n0\n", recorder)
+        # item, --only=n, confirm
+        menu, _ = make_menu("5\nn\nyes\n\n0\n", recorder)
         menu.run()
         self.assertEqual(recorder.names(), ["detach", "detach"])
         self.assertTrue(recorder.calls[0].dry_run)              # the preview comes first
         self.assertTrue(recorder.calls[1].yes)                  # and only then the real run
         self.assertFalse(recorder.calls[1].dry_run)
 
+    def test_detach_can_be_narrowed_to_named_plugins(self):
+        """``--only`` reaches the command, so one plugin can be detached alone."""
+        recorder = Recorder()
+        # item, --only=y, names, confirm
+        menu, _ = make_menu("5\ny\ndsh-read-url\nyes\n\n0\n", recorder)
+        menu.run()
+        self.assertEqual(recorder.names(), ["detach", "detach"])
+        self.assertEqual(recorder.calls[0].only, ["dsh-read-url"])
+        self.assertEqual(recorder.calls[1].only, ["dsh-read-url"])
+
     def test_attach_previews_with_flags_then_cancels(self):
         recorder = Recorder()
-        # item, target(Enter), snapshot(Enter=freshest), --update=y, unknown=y, prune=n, cancel
-        menu, _ = make_menu("6\n\n\ny\ny\nn\nn\n\n0\n", recorder)
+        # item, target(Enter), snapshot(Enter=freshest), --only=n, --update=y, unknown=y,
+        # prune=n, cancel
+        menu, _ = make_menu("6\n\n\nn\ny\ny\nn\nn\n\n0\n", recorder)
         menu.run()
         self.assertEqual(recorder.names(), ["attach"])
         call = recorder.calls[0]
         self.assertTrue(call.dry_run)
+        self.assertIsNone(call.only)           # the whole snapshot
         self.assertTrue(call.update)           # «y»
         self.assertTrue(call.install_unknown)  # «y»
         self.assertFalse(call.prune_failed)    # «n»
@@ -450,10 +464,31 @@ class MenuSafetyTest(unittest.TestCase):
 
     def test_plugins_previews_then_cancels(self):
         recorder = Recorder()
-        menu, _ = make_menu("8\n\nn\n\n0\n", recorder)
+        # item, --install-unknown=n, --detach-first=n, cancel, pause, exit
+        menu, _ = make_menu("8\nn\nn\nn\n\n0\n", recorder)
         menu.run()
         self.assertEqual(recorder.names(), ["plugins"])
         self.assertTrue(recorder.calls[0].dry_run)
+
+    def test_plugins_defaults_leave_the_unknowns_and_the_detach_off(self):
+        """Enter accepts the safe default: update in place, nothing unconfirmed."""
+        recorder = Recorder()
+        # item, --install-unknown=Enter, --detach-first=Enter, cancel, pause, exit
+        menu, _ = make_menu("8\n\n\n\n\n0\n", recorder)
+        menu.run()
+        self.assertFalse(recorder.calls[0].install_unknown)
+        self.assertFalse(recorder.calls[0].detach_first)
+
+    def test_plugins_can_opt_into_the_unconfirmed_and_the_detach(self):
+        recorder = Recorder()
+        # item, --install-unknown=y, --detach-first=y, confirm, pause, exit
+        menu, _ = make_menu("8\ny\ny\nyes\n\n0\n", recorder)
+        menu.run()
+        self.assertEqual(recorder.names(), ["plugins", "plugins"])
+        self.assertTrue(recorder.calls[0].install_unknown)
+        self.assertTrue(recorder.calls[0].detach_first)
+        self.assertTrue(recorder.calls[0].dry_run)
+        self.assertTrue(recorder.calls[1].yes)
 
     def test_recheck_without_install_runs_once(self):
         recorder = Recorder()

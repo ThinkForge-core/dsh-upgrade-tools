@@ -10,13 +10,15 @@ and the widest column (usually ``reason``) is the one that gives way first.
 from __future__ import annotations
 
 from . import style
-from .compat import STATUS_COMPATIBLE, STATUS_INCOMPATIBLE, STATUS_UNKNOWN
+from .compat import (STATUS_COMPATIBLE, STATUS_INCOMPATIBLE, STATUS_UNKNOWN,
+                     STATUS_VERIFIED)
 
 #: Short status marks used in every table.
 GLYPH = {
     STATUS_COMPATIBLE: "ok",
     STATUS_INCOMPATIBLE: "NO",
     STATUS_UNKNOWN: "??",
+    STATUS_VERIFIED: "✓",
 }
 
 #: Human readable status names.
@@ -24,6 +26,7 @@ STATUS_LABEL = {
     STATUS_COMPATIBLE: "compatible",
     STATUS_INCOMPATIBLE: "incompatible",
     STATUS_UNKNOWN: "unconfirmed",
+    STATUS_VERIFIED: "verified",
 }
 
 #: ANSI style per status.
@@ -31,10 +34,11 @@ STATUS_STYLE = {
     STATUS_COMPATIBLE: "green",
     STATUS_INCOMPATIBLE: "bold,red",
     STATUS_UNKNOWN: "yellow",
+    STATUS_VERIFIED: "bold,green",
 }
 
-#: Order in which status groups are printed (worst first).
-STATUS_ORDER = (STATUS_INCOMPATIBLE, STATUS_UNKNOWN, STATUS_COMPATIBLE)
+#: Order in which status groups are printed (worst first, strongest last).
+STATUS_ORDER = (STATUS_INCOMPATIBLE, STATUS_UNKNOWN, STATUS_COMPATIBLE, STATUS_VERIFIED)
 
 GAP = 2          # spaces between columns
 FLOOR = 6        # a column never gets narrower than this
@@ -63,6 +67,76 @@ def group_title(status: str | None, count: int) -> str:
 
 def short_version(value: str | None) -> str:
     return value if value else "—"
+
+
+#: Mark prefixed to a version that has a newer release available.
+UPDATE_MARK = "↑"
+
+
+def has_update(plugin: dict) -> bool:
+    """Is a newer version of this plugin published than the installed one?"""
+    latest = plugin.get("latest")
+    if not latest:
+        return False
+    installed = plugin.get("localVersion") or plugin.get("version")
+    return latest != installed
+
+
+def update_kind(plugin: dict) -> str | None:
+    """What kind of update is available, or ``None``.
+
+    ``"install"`` — the newest version evaluates compatible, so the tool would
+    install it. ``"newer"`` — a newer version exists but was NOT confirmed
+    compatible (``??`` or incompatible), so it is flagged, not offered. The
+    distinction keeps the marker from promising an upgrade the tool would refuse.
+
+    The verdict ``latest_status`` decides this, not ``recommended``: the latter
+    defaults to the plugin's own specifier for every entry and is only replaced
+    when a compatible newer version was found, so a truthy ``recommended`` alone
+    does not mean an update exists.
+    """
+    if not has_update(plugin):
+        return None
+    if plugin.get("latest_status") == STATUS_COMPATIBLE:
+        return "install"
+    return "newer"
+
+
+def version_cell(plugin: dict) -> str:
+    """The version column: the installed version, marked when an update exists.
+
+    The marker is a prefix rather than a suffix so that it is the first thing read
+    in the cell, and it survives the ``old→new`` rendering of a local plugin whose
+    artifact differs from the installed copy.
+    """
+    version = plugin.get("localVersion") or plugin.get("version")
+    if plugin.get("localVersion") and plugin.get("version") \
+            and plugin["localVersion"] != plugin["version"]:
+        version = f"{plugin['version']}→{plugin['localVersion']}"
+    text = short_version(version)
+    kind = update_kind(plugin)
+    if kind == "install":
+        return style.paint(f"{UPDATE_MARK} {text}", "bold", "green")
+    if kind == "newer":
+        return style.paint(f"{UPDATE_MARK} {text}", "yellow")
+    return text
+
+
+def latest_cell(plugin: dict) -> str:
+    """The ``latest`` column: the newest published version, marked when relevant.
+
+    Green/bold when the tool confirmed it as compatible, yellow when it is newer
+    than the installed copy but unconfirmed.
+    """
+    latest = plugin.get("latest")
+    if not latest:
+        return "—"
+    kind = update_kind(plugin)
+    if kind == "install":
+        return style.paint(latest, "bold", "green")
+    if kind == "newer":
+        return style.paint(latest, "yellow")
+    return latest
 
 
 def _as_text(cell) -> str:
@@ -251,16 +325,12 @@ def analysis_rows(plugins: list[dict]) -> list[list[str]]:
     """Rows of the compatibility matrix, one per plugin."""
     rows = []
     for plugin in plugins:
-        version = plugin.get("localVersion") or plugin.get("version")
-        if plugin.get("localVersion") and plugin.get("version") \
-                and plugin["localVersion"] != plugin["version"]:
-            version = f"{plugin['version']}→{plugin['localVersion']}"
         rows.append([
             status_glyph(plugin["status"]),
             plugin["name"],
-            short_version(version),
+            version_cell(plugin),
             plugin.get("sourceLabel") or plugin.get("source") or "—",
-            (plugin.get("latest") or "—") if plugin.get("latest") else "—",
+            latest_cell(plugin),
             plugin.get("reason") or "",
         ])
     return rows
@@ -285,6 +355,7 @@ def print_counts(counts: dict[str, int]) -> None:
         style.paint(f"compatible: {counts.get(STATUS_COMPATIBLE, 0)}", "green"),
         style.paint(f"incompatible: {counts.get(STATUS_INCOMPATIBLE, 0)}", "bold", "red"),
         style.paint(f"unconfirmed: {counts.get(STATUS_UNKNOWN, 0)}", "yellow"),
+        style.paint(f"verified: {counts.get(STATUS_VERIFIED, 0)}", "bold", "green"),
     ]
     print("  " + "   ".join(parts))
 
@@ -312,6 +383,46 @@ def print_unknown_hint(analysis) -> None:
                          "in its 'loads' column."))
 
 
+def print_verified_hint(analysis) -> None:
+    """Explain the strongest verdict once per report."""
+    verified = [plugin for plugin in analysis.plugins if plugin["status"] == STATUS_VERIFIED]
+    if not verified:
+        return
+    print()
+    print(bullet("verified = every check that ran found nothing wrong AND the installed copy "
+                 "was proven at runtime on this core: 'verify' imported it, called its "
+                 "apply() and called the route handlers it registered."))
+
+
+def print_update_hint(analysis) -> None:
+    """Explain the update marker once per report, and why it may be absent.
+
+    The ``latest`` column is only filled by ``--update``; without it no update can
+    be detected at all, and saying so prevents an empty column from reading as
+    "everything is current".
+    """
+    installable = [plugin for plugin in analysis.plugins if update_kind(plugin) == "install"]
+    newer = [plugin for plugin in analysis.plugins if update_kind(plugin) == "newer"]
+    if not installable and not newer:
+        if not getattr(analysis, "checked_updates", False):
+            print()
+            print(bullet("no update column: versions on the registry are only queried with "
+                         "'--update'."))
+        return
+    print()
+    if installable:
+        names = ", ".join(f"{plugin['name']}@{plugin['latest']}" for plugin in installable)
+        print(bullet(style.paint(f"{UPDATE_MARK} installable", "bold", "green")
+                     + f" — the newest published version is compatible: {names}"))
+    if newer:
+        names = ", ".join(f"{plugin['name']} {plugin['version']}→{plugin['latest']}"
+                          for plugin in newer)
+        print(bullet(style.paint(f"{UPDATE_MARK} newer, not confirmed", "yellow")
+                     + " — a newer version is published but was NOT confirmed compatible, so "
+                       "'plugins' holds it back unless '--install-unknown' is given: "
+                     + names))
+
+
 def print_analysis(analysis, *, verbose: bool = False, width: int | None = None) -> None:
     """Print the compatibility matrix: header notes, grouped table, summary."""
     print()
@@ -336,6 +447,8 @@ def print_analysis(analysis, *, verbose: bool = False, width: int | None = None)
     print()
     print_counts(counts)
     print_unknown_hint(analysis)
+    print_verified_hint(analysis)
+    print_update_hint(analysis)
 
     if verbose:
         print_verbose(analysis, width=width)

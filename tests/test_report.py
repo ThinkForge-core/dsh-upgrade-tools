@@ -9,6 +9,8 @@ Run: python3 -m unittest discover -s tests -v
 
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 import unittest
 from pathlib import Path
@@ -16,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dshupgrade import report, style  # noqa: E402
+from dshupgrade.analysis import Analysis  # noqa: E402
 from dshupgrade.compat import (  # noqa: E402
     STATUS_COMPATIBLE,
     STATUS_INCOMPATIBLE,
@@ -166,6 +169,118 @@ class ColorTest(unittest.TestCase):
         self.assertEqual(style.normalize_mode("off"), "never")
         self.assertEqual(style.normalize_mode("nonsense"), "auto")
         self.assertEqual(style.normalize_mode(None), "auto")
+
+
+class UpdateMarkerTest(unittest.TestCase):
+    """The version column marks plugins that have a newer published version.
+
+    ``recommended`` is NOT the signal: it defaults to the plugin's own specifier
+    and stays truthy even when no update exists, so an entry that merely carries a
+    specifier must not be marked. The verdict ``latest_status`` decides.
+    """
+
+    def setUp(self):
+        style.set_mode("never")
+
+    def tearDown(self):
+        style.set_mode("auto")
+
+    @staticmethod
+    def entry(**extra) -> dict:
+        entry = {"name": "p", "status": STATUS_COMPATIBLE, "version": "1.0.0",
+                 "source": "npm", "latest": None, "latest_status": None,
+                 # The default every real entry carries, whether or not an update exists.
+                 "recommended": "p@1.0.0"}
+        entry.update(extra)
+        return entry
+
+    def test_no_update_when_latest_is_the_installed_version(self):
+        entry = self.entry(latest="1.0.0", latest_status=STATUS_COMPATIBLE)
+        self.assertIsNone(report.update_kind(entry))
+        self.assertEqual(report.version_cell(entry), "1.0.0")
+
+    def test_no_update_without_registry_data(self):
+        """No '--update' means no data, which is not an update."""
+        self.assertIsNone(report.update_kind(self.entry()))
+        self.assertEqual(report.version_cell(self.entry()), "1.0.0")
+
+    def test_specifier_alone_is_not_an_update(self):
+        """A truthy ``recommended`` must not be read as an available upgrade."""
+        entry = self.entry(latest="1.0.0", latest_status=None)
+        self.assertIsNone(report.update_kind(entry))
+
+    def test_compatible_newer_version_is_installable(self):
+        entry = self.entry(latest="1.1.0", latest_status=STATUS_COMPATIBLE)
+        self.assertEqual(report.update_kind(entry), "install")
+        self.assertIn(report.UPDATE_MARK, report.version_cell(entry))
+
+    def test_unconfirmed_newer_version_is_flagged_not_offered(self):
+        """`??` means "not confirmed", so the tool would refuse to install it."""
+        entry = self.entry(latest="1.1.0", latest_status=STATUS_UNKNOWN)
+        self.assertEqual(report.update_kind(entry), "newer")
+
+    def test_incompatible_newer_version_is_flagged_not_offered(self):
+        entry = self.entry(latest="2.0.0", latest_status=STATUS_INCOMPATIBLE)
+        self.assertEqual(report.update_kind(entry), "newer")
+
+    def test_local_plugin_update_uses_local_version(self):
+        """A local plugin's installed copy is ``localVersion``, not ``version``."""
+        entry = self.entry(localVersion="1.0.0", latest="1.0.0")
+        self.assertIsNone(report.update_kind(entry))
+
+    def test_marker_survives_the_drift_arrow_rendering(self):
+        entry = self.entry(version="1.0.0", localVersion="1.0.1", latest="2.0.0",
+                           latest_status=STATUS_COMPATIBLE)
+        cell = report.version_cell(entry)
+        self.assertIn("1.0.0→1.0.1", cell)
+        self.assertTrue(cell.startswith(report.UPDATE_MARK))
+
+    def test_marker_is_visible_with_colors_on(self):
+        style.set_mode("always")
+        entry = self.entry(latest="1.1.0", latest_status=STATUS_COMPATIBLE)
+        cell = report.version_cell(entry)
+        self.assertIn(report.UPDATE_MARK, style.strip(cell))
+        self.assertIn("\033[", cell)
+
+    def test_marked_row_keeps_the_table_alignment(self):
+        rows = report.analysis_rows([
+            self.entry(latest="1.1.0", latest_status=STATUS_COMPATIBLE),
+            self.entry(latest=None),
+        ])
+        style.set_mode("never")
+        plain = report.table(HEADERS, rows, width=100)
+        style.set_mode("always")
+        colored = report.table(HEADERS, rows, width=100)
+        self.assertEqual([style.strip(line) for line in colored.splitlines()],
+                         plain.splitlines())
+
+    def test_legend_names_the_installable_target(self):
+        entries = [self.entry(name="p", latest="1.1.0", latest_status=STATUS_COMPATIBLE)]
+        analysis = Analysis(target="1.0.0", current_core="1.0.0", checkout=None,
+                            plugins=entries, checked_updates=True)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            report.print_update_hint(analysis)
+        self.assertIn("installable", buffer.getvalue())
+
+    def test_legend_says_why_the_column_is_empty_without_update(self):
+        """An empty column must not read as "everything is current"."""
+        analysis = Analysis(target="1.0.0", current_core="1.0.0", checkout=None,
+                            plugins=[self.entry()], checked_updates=False)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            report.print_update_hint(analysis)
+        self.assertIn("--update", buffer.getvalue())
+
+    def test_no_legend_when_updates_were_checked_and_none_exist(self):
+        analysis = Analysis(target="1.0.0", current_core="1.0.0", checkout=None,
+                            plugins=[self.entry(latest="1.0.0",
+                                                latest_status=STATUS_COMPATIBLE)],
+                            checked_updates=True)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            report.print_update_hint(analysis)
+        self.assertEqual(buffer.getvalue().strip(), "")
 
 
 class WrappingHelperTest(unittest.TestCase):

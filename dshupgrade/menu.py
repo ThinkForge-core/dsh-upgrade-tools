@@ -231,7 +231,7 @@ class Action:
 
 ACTIONS: tuple[Action, ...] = (
     Action("1", "Status: core, tags, profile plugins", "status",
-           hint="changes nothing"),
+           hint="fast: cache and profile files only, nothing is executed"),
     Action("2", "Core versions: what the registry offers", "core_versions"),
     Action("3", "Plan: new core versions and what happens to plugins", "plan",
            hint="quick, declarations only"),
@@ -240,7 +240,8 @@ ACTIONS: tuple[Action, ...] = (
     Action("5", "Snapshot and detach ALL plugins", "detach", danger=True),
     Action("6", "Install plugins from a snapshot", "attach", danger=True),
     Action("7", "Recheck the incompatible list", "recheck"),
-    Action("8", "Update plugins only (leave the core alone)", "plugins", danger=True),
+    Action("8", "Update plugins that have a newer version (core untouched)", "plugins",
+           danger=True, hint="nothing else in the profile is touched"),
     Action("9", "Full pipeline: detach → core → install", "pipeline", danger=True),
     Action("10", "Incompatible list: show contents", "show_incompatible"),
     Action("11", "Settings: profile, target, modes", "settings"),
@@ -340,6 +341,7 @@ class Menu:
             "checkouts": settings.checkouts,
             # flags of specific commands
             "update": False,
+            "detach_first": False,
             "yes": False,
             "dry_run": False,
             "from_file": None,
@@ -384,6 +386,18 @@ class Menu:
             self.settings.core = None
         elif answer:
             self.settings.core = answer
+
+    def ask_only(self, action: str) -> list[str] | None:
+        """Let the reader narrow an operation to some plugins (``--only``).
+
+        Enter keeps the whole profile, which is the default of the operation; names
+        are validated by the command itself, so a typo is reported rather than
+        silently ignored.
+        """
+        answer = self.console.ask(
+            f"  Only some plugins? Names separated by spaces (Enter — every plugin) "
+            f"to {action}: ").strip()
+        return answer.split() or None
 
     # ----------------------------------------------------------------- actions
     def shadows_now(self):
@@ -475,11 +489,12 @@ class Menu:
         print_loader_tree(profile, shadowed)
 
     def act_status(self) -> None:
-        # The menu is the human path, so the loads column is filled in (a probe runs
-        # only when the cache is missing or stale — an upgrade changes the fingerprint).
-        # The surface column and the shadowed-surface section come from the effective
-        # loader tree, which is read from the profile's own patch layers every time.
-        self.call("status", verify=True)
+        # The overview has to stay cheap, so nothing is executed here: the loads
+        # column shows the verdicts a previous verify left in the cache (a stale cache
+        # is ignored, an absent one leaves the column at "?"). The runtime probe is
+        # item 14; the surface column and the shadowed-surface section come from the
+        # effective loader tree, which is read from the profile's own patch layers.
+        self.call("status")
         self.warn_wire()
         self.offer_loader()
 
@@ -555,21 +570,28 @@ class Menu:
             self.console.write("  " + self.console.paint("No incompatibility proven.", "green"))
 
     def act_detach(self) -> None:
+        distinct = self.console.ask_yes(
+            "  Detach only some plugins (--only)? The snapshot still records every plugin.",
+            default=False)
+        only = self.ask_only("detach") if distinct else None
         self.console.write()
         self.console.write("  " + self.console.paint("PREVIEW (--dry-run): what will be detached",
                                                      "bold"))
-        self.call("detach", dry_run=True)
+        self.call("detach", dry_run=True, only=only)
+        scope = "ALL plugins of the profile" if not only else f"{len(only)} selected plugin(s)"
         if not self.console.confirm_yes(
-                "  Detach ALL plugins of the profile? A snapshot will be written, "
-                "the data (~/.dsh) stays."):
+                f"  Detach {scope}? A snapshot will be written, the data (~/.dsh) stays."):
             self.console.write("  cancelled")
             return
-        self.call("detach", yes=True)
+        self.call("detach", yes=True, only=only)
 
     def act_attach(self) -> None:
         self.ask_core()
         from_file = self.console.ask_path(
             "  Snapshot file (Enter — the freshest one, Tab completes): ")
+        distinct = self.console.ask_yes(
+            "  Restore only some plugins from the snapshot (--only)?", default=False)
+        only = self.ask_only("restore") if distinct else None
         update = self.console.ask_yes("  Install the newest compatible versions (--update)?",
                                       default=True)
         unknown = self.console.ask_yes(
@@ -578,7 +600,8 @@ class Menu:
             default=False)
         prune = self.console.ask_yes("  Detach the plugins that fail the post-check "
                                      "(--prune-failed)?", default=False)
-        overrides = {"update": update, "install_unknown": unknown, "prune_failed": prune}
+        overrides = {"update": update, "install_unknown": unknown, "prune_failed": prune,
+                     "only": only}
         if from_file:
             overrides["from_file"] = from_file
         self.console.write()
@@ -618,16 +641,22 @@ class Menu:
             self.call("recheck", **overrides)
 
     def act_plugins(self) -> None:
-        update = self.console.ask_yes("  Install the newest compatible versions (--update)?",
-                                      default=True)
+        unknown = self.console.ask_yes(
+            "  Also install a newer version that is not confirmed for this core "
+            "(--install-unknown), with a post-install code check?", default=False)
+        detach_first = self.console.ask_yes(
+            "  Remove each plugin before installing its new version (--detach-first)? "
+            "Otherwise the new version is installed over the current copy.",
+            default=False)
+        overrides = {"install_unknown": unknown, "detach_first": detach_first}
         self.console.write()
         self.console.write("  " + self.console.paint("PREVIEW (--dry-run)", "bold"))
-        self.call("plugins", dry_run=True, update=update)
+        self.call("plugins", dry_run=True, **overrides)
         if not self.console.confirm_yes(
-                "  Detach and reinstall the profile plugins (the core is left alone)?"):
+                "  Update every plugin that has a newer version (the core is left alone)?"):
             self.console.write("  cancelled")
             return
-        self.call("plugins", yes=True, update=update)
+        self.call("plugins", yes=True, **overrides)
 
     def act_pipeline(self) -> None:
         self.ask_core()

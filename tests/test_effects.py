@@ -386,6 +386,39 @@ class ClientHalfTest(unittest.TestCase):
         self.assertNotIn("name: x", effects.blank_line_strings(line))
         self.assertIn("ui-workspace", effects.blank_line_strings(line))
 
+    def test_a_line_without_a_literal_is_returned_untouched(self):
+        """The common case, and the one that keeps the scan over megabytes cheap."""
+        line = "const plain = 1;"
+        self.assertIs(effects.blank_line_strings(line), line)
+
+
+class EvidenceScanTest(unittest.TestCase):
+    """Every candidate name is looked for in ONE walk over the client bundle."""
+
+    def test_the_first_line_naming_a_token_is_the_evidence(self):
+        text = "const a = 1;\n// uses ui-workspace here\nconst b = 2;\n"
+        found = effects._evidence_lines(text, ["ui-workspace"], "client.js")
+        self.assertEqual(found["ui-workspace"], "client.js:2: // uses ui-workspace here")
+
+    def test_several_tokens_are_reported_from_the_same_walk(self):
+        text = "code ui-one here\ncode ui-two here\n" * 3
+        found = effects._evidence_lines(text, ["ui-one", "ui-two"], "client.js")
+        self.assertEqual(found["ui-one"], "client.js:1: code ui-one here")
+        self.assertEqual(found["ui-two"], "client.js:2: code ui-two here")
+
+    def test_a_name_inside_a_longer_identifier_is_not_evidence(self):
+        """``ui-one`` inside ``aa-ui-one`` is a different name, not this row's."""
+        found = effects._evidence_lines("const aa-ui-one = 1;\n", ["ui-one"], "client.js")
+        self.assertEqual(found, {})
+
+    def test_a_name_that_only_occurs_inside_a_string_is_not_evidence(self):
+        text = 'const hint = "skill-filesystem scans this";\n'
+        self.assertEqual(effects._evidence_lines(text, ["skill-filesystem"], "client.js"), {})
+
+    def test_a_token_no_line_carries_is_simply_absent(self):
+        found = effects._evidence_lines("nothing here\n", ["ui-nope"], "client.js")
+        self.assertEqual(found, {})
+
 
 class SurfaceTextTest(unittest.TestCase):
     def probe(self, **kwargs) -> verify_mod.Probe:

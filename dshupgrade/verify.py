@@ -1287,6 +1287,37 @@ def handler_leads(probe: Probe) -> list[tuple[str, dict]]:
     return found
 
 
+def runtime_verified(probe: Probe) -> bool:
+    """Did the probe prove this copy WORKS on the core it was measured against?
+
+    The whole chain has to hold: the server entry imported, ``apply()`` did not
+    throw, and every route handler it registered answered its first call. A probe
+    that never ran (``unavailable``), a plugin with no server half (``client``) and a
+    plugin that is not installed (``missing``) prove nothing and are not verified.
+
+    This is a statement about one core version — the one the probe ran against. A
+    verdict from an older cache does not survive a core change: it is stored under a
+    fingerprint that includes the core, so the caller only ever sees verdicts taken
+    against the core it asked about.
+    """
+    if probe.status != LOADS:
+        return False
+    if probe.apply_error:
+        return False
+    return not handler_failures(probe)
+
+
+def verified_names(profile, core: str | None) -> set[str]:
+    """Names whose CACHED verdict proves they work on ``core``.
+
+    Reads the cache only — no plugin code is executed. Stale verdicts are dropped by
+    the fingerprint check inside :func:`load_cache`, so a caller may use the result
+    without re-checking the core version itself.
+    """
+    return {name for name, probe in load_cache(profile, core).items()
+            if runtime_verified(probe)}
+
+
 def surface_text(probe: Probe, *, shadowed: bool = False, suspect: bool = False,
                  dead_wire: int = 0, client: bool = False) -> str:
     """The ``surface`` cell: what this plugin actually puts into the deployment.

@@ -87,7 +87,11 @@ python3 dsh_upgrade.py check --core 0.1.5-rc.2 --verbose
 python3 dsh_upgrade.py pipeline --core 0.1.5-rc.2 --yes
 
 # 5. Or plugins only, leaving the core alone
-python3 dsh_upgrade.py plugins --update --yes
+#    (updates the plugins that have a newer version; the rest are not touched)
+python3 dsh_upgrade.py plugins --yes
+
+# 5a. Including the plugins whose newer version is not confirmed for this core
+python3 dsh_upgrade.py plugins --install-unknown --yes
 
 # 6. Later: recheck the deferred ones and install the ones that became compatible
 python3 dsh_upgrade.py recheck --install --yes
@@ -104,21 +108,22 @@ dsh-upgrade — DSH core and profile plugin upgrade
   target: auto — 0.1.5-rc.2 · mode: online · core directory: …/node_modules/@deepseek-ai/dsh
 
   read-only — the profile is not touched
-   1   Status: core, tags, profile plugins
+   1   Status: core, tags, profile plugins  — fast: cache and profile files only, nothing is executed
    2   Core versions: what the registry offers
-   3   Plan: new core versions and what happens to plugins
-   4   Check: full compatibility matrix
+   3   Plan: new core versions and what happens to plugins  — quick, declarations only
+   4   Check: full compatibility matrix  — checkout of the target + code scans
   10   Incompatible list: show contents
   11   Settings: profile, target, modes
   12   CLI flag reference
-  13   Inspect: a plugin that is NOT installed yet
+  13   Inspect: a plugin that is NOT installed yet  — a directory or a .tgz; nothing is installed
+  14   Verify: do the installed plugins load — and do they DO anything?  — imports each one, calls apply(), calls the route handlers it registered, reports shadowed surfaces
    0   Exit
 
   may change the profile
    5 ! Snapshot and detach ALL plugins
    6 ! Install plugins from a snapshot
    7   Recheck the incompatible list
-   8 ! Update plugins only (leave the core alone)
+   8 ! Update plugins that have a newer version (core untouched)  — nothing else in the profile is touched
    9 ! Full pipeline: detach → core → install
 
 Tip: 4 — check before upgrading, 9 — the whole pipeline.
@@ -145,14 +150,24 @@ Tip: 4 — check before upgrading, 9 — the whole pipeline.
   reached at all. The header resolves it from the registry cache, so it never blocks.
 * Items 5, 6, 8, 9 **are first executed with `--dry-run`** and ask for confirmation with the word
   `yes`; the core upgrade (`npm i -g`) in the pipeline is only printed by default.
+* Items **5** and **6** ask first whether the operation should be narrowed to a few plugins and
+  then pass those names as `--only`, so one plugin can be detached or restored on its own. The
+  preview then shows exactly that selection. Item **8** asks two questions instead: whether to also
+  install a newer version that is **not confirmed** for this core (`--install-unknown`) and whether
+  to remove each plugin before installing its new version (`--detach-first`, off by default — the
+  new version is installed over the current copy). It needs no `--only` question because it only
+  ever touches the plugins that have a newer version; narrow it with `--only` on the command line
+  when you want a single plugin.
 * The menu does not duplicate logic: it assembles the same arguments and calls the same `cmd_*`
   functions as the CLI.
 * Item **14** (verify) executes the question the declarations cannot answer: it imports the
   installed copy of every plugin, calls its `apply()`, and reports what each one registers — plus any
   plugin whose UI host row is switched off (see
   [Do they actually work?](#do-they-actually-work)). It also asks whether to run the `--live` probe
-  against the running DSH. Item **1** (status) shows both columns and the shadowed-surface section,
-  and fills the probe results in by itself when the cache is missing or stale.
+  against the running DSH. Item **1** (status) shows both columns and the shadowed-surface section
+  from what is already known — the cached probe verdicts and the profile files — and never starts a
+  probe itself, so the overview stays fast; run item 14 to refresh the verdicts. That is also the
+  step that turns unconfirmed plugins into [verified](#verified--checked-and-seen-working) ones.
 * Run without arguments **outside a terminal** (a pipe, cron, a script) it does not hang — it
   prints the action map (`dsh-upgrade — available actions:`) and exits with code 0.
 
@@ -189,16 +204,16 @@ beats the saved setting (see [Environment variables](#environment-variables)).
 | Command | What it does |
 |---|---|
 | `menu` | Interactive menu (the same one opens with no arguments). |
-| `status [--verify] [--loader] [--summary]` | Core version and directory, tags, recent versions, table of plugins with sources **and `loads` + `surface` columns** — whether the installed copy imports, and what it actually registers. `--verify` fills them in (probes only when what it measured has changed); `--loader` prints the whole effective loader tree, marking the rows a shadowed plugin draws into; `--summary` prints one line of counts instead of the report. |
+| `status [--verify] [--loader] [--summary]` | Core version and directory, tags, recent versions, table of plugins with sources **and `loads` + `surface` columns** — whether the installed copy imports, and what it actually registers. The columns show the verdicts a previous `verify` left in the cache; without `--verify` nothing is executed, so the command is a fast read of the profile and the state files. `--verify` fills a missing or stale cache in; `--loader` prints the whole effective loader tree, marking the rows a shadowed plugin draws into; `--summary` prints one line of counts instead of the report. |
 | `verify [--cached] [--live] [--no-handlers] [--web-url URL] [--loader] [--summary \| --diff PATH]` | Import the installed copy of every plugin with `node`, call its `apply()`, then **call every route handler `apply()` registered once** and read what it threw and logged — plus which plugins have a **shadowed surface** (their UI host row is switched off). `--live` also GETs every registered route on the running DSH (`--web-url`, default `http://127.0.0.1:3080`), which proves the row applied. `--no-handlers` skips the handler calls — a weaker answer, so it is not cached. `--loader` prints the effective loader tree with the shadowed rows marked. `--summary` prints one line of counts; `--diff PATH` prints only what changed since a result saved earlier. Writes `state/verified-<profile>.json`. |
 | `core-versions` | All core versions and tags, how many are newer than the installed one. |
 | `plan [--limit N] [--all]` | **In a single run**: all new core versions and what happens to plugins on each (fast, declarations only). |
-| `check --core V [--update] [--summary]` | Compatibility matrix: what happens to each plugin on version `V`. Writes the incompatible list; `--summary` prints one line of counts instead of the matrix. |
+| `check --core V [--update] [--summary]` | Compatibility matrix: what happens to each plugin on version `V`. Reads the cached runtime verdicts to grade what the probe has proven on the installed core (see [Verified](#verified--checked-and-seen-working)); `--update` also queries the registry and marks the plugins that have a newer published version (see [Available updates](#available-updates)); `--summary` prints one line of counts instead of the matrix. Writes the incompatible list. |
 | `inspect PATH [--core V] [--since OLD]` | Compatibility of an artifact that is **not installed yet** — a plugin directory or a `.tgz`. Reads only that artifact; the profile is not read and nothing is installed. |
-| `detach [--yes]` | Snapshot of the profile and detaching of ALL plugins. Without `--yes` it only writes the snapshot and aborts. |
-| `attach [--from F] [--update] [--install-unknown] [--prune-failed] [--yes]` | Installation from a snapshot: installs the compatible ones, the rest go into the list. |
+| `detach [--only NAME…] [--yes]` | Snapshot of the whole profile and detaching of the plugins — all of them, or with `--only` just the named ones. Without `--yes` it only shows the plan and aborts. |
+| `attach [--from F] [--only NAME…] [--update] [--install-unknown] [--prune-failed] [--yes]` | Installation from a snapshot: installs the compatible ones, the rest go into the list. `--only` restores just the named plugins from the snapshot. |
 | `recheck [--file F] [--install] [--install-unknown] [--yes]` | Recheck the incompatible list and install the ones that became compatible; with `--install-unknown` also the unconfirmed ones (post-checked). |
-| `plugins [--update] [--yes]` | Update plugins only, on the current core. |
+| `plugins [--only NAME…] [--install-unknown] [--detach-first] [--yes]` | Update the plugins that have a newer version, on the current core — all of them, or with `--only` just the named ones. Nothing else in the profile is touched: a plugin with nothing newer is not detached and not reinstalled (see [Only the plugins with an update](#only-the-plugins-with-an-update)). `--install-unknown` also installs a newer version that is not confirmed for this core; `--detach-first` removes each plugin before installing its new version. |
 | `pipeline [--core V] [--update] [--install-unknown] [--run-core-upgrade] [--yes]` | Full pipeline from check to post-check. `--install-unknown` is **off** by default: only proven-compatible plugins are installed, everything else goes into the incompatible list. |
 
 Wrapper scripts for each step live in `scripts/` (`menu.py`, `status.py`, `verify.py`, `plan.py`,
@@ -222,11 +237,73 @@ The `latest` dist-tag is deliberately not used: on the real registry `latest` po
 `0.1.5-rc.1` while `0.1.5-rc.2` was already published under `next`. The installed core is only a
 fallback for when the registry cannot be reached at all; `plan` lists every candidate.
 
+**A target has to be a version the tool can obtain.** A check compares plugins against a version, so
+that version must be the installed core, a checkout already on disk, or one the registry publishes.
+Anything else is refused with exit code `1` and a message naming what is published — a version
+nobody published has no inventory to compare with, and reporting every plugin as "unconfirmed"
+because of a typo would look like a result. `--offline` and `--no-clone` narrow what can be obtained,
+not what is accepted: a version with no local copy is reported as unconfirmable rather than guessed at.
+
+**Any operation can be narrowed to some plugins.** `plugins`, `detach` and `attach` take
+`--only NAME…` and then touch exactly those plugins, leaving the rest of the profile as it is. Names
+are matched exactly and a name the profile does not have is an error listing the installed ones, so a
+typo cannot turn into a silent no-op. Two details follow from what a snapshot is: `detach --only`
+still writes the snapshot of the WHOLE profile (a snapshot describes a state, not an operation), and
+`plugins --only` leaves the incompatible list describing every plugin by rebuilding it from the
+post-check. In the menu the same choice is a question before the preview, in items 5 and 6; item 8
+only ever touches the plugins that have a newer version, so it asks about `--install-unknown` and
+`--detach-first` instead.
+
 **Unconfirmed plugins are opt-in.** A plugin with no declarations is neither proven compatible
-nor proven broken, so `pipeline`, `attach` and `recheck` install it only with
+nor proven broken, so `pipeline`, `attach`, `recheck` and `plugins` install it only with
 `--install-unknown` (default: off). In the menu the same choice is a question with the `[y/N]`
 default. Whatever is installed that way is re-judged afterwards by the post-check over the code
-that actually landed, and the failures go into the incompatible list.
+that actually landed, and the failures go into the incompatible list. For `plugins` that flag is
+also what decides whether a **newer** but unconfirmed version may be installed; without it the
+plugin is left exactly as it is and named in the `Held back` section, never dropped.
+
+### Only the plugins with an update
+
+`plugins` is an update command, not a repair command: it touches **only the plugins that have a
+newer version**, and a plugin with nothing newer is not detached, not reinstalled and not dropped.
+A run therefore cannot leave a plugin out of the profile, and repairing a profile as a whole is what
+`detach` followed by `attach` is for. Every name lands in exactly one of three groups, each printed
+with its reason:
+
+```
+=== To update (2) ===
+    ↑ dsh-alpha → 1.4.0
+    ↑ dsh-read-url → 1.8.0  not confirmed for this core — installed because of
+                            --install-unknown, checked afterwards
+
+=== Held back — a newer version exists (1) ===
+    · dsh-beta 1.2.0 → 1.3.0: 1.3.0 is published but proven incompatible with this core
+
+=== Left alone — nothing to update (1) ===
+    · dsh-gamma 0.19.1: no newer version is published
+```
+
+A newer version that evaluates `compatible` on the current core is installed by itself. A newer
+version that is merely **unconfirmed** — the plugin declares no DSH version, or its declarations do
+not admit this core — is *held back* and named, because installing it is a choice:
+
+```
+    · dsh-read-url 1.7.0 → 1.8.0: 1.8.0 is published but not confirmed for this core
+      — pass --install-unknown to install it anyway, with a post-install code check
+```
+
+With `--install-unknown` it moves into the first group, is installed, and the post-check re-runs the
+code checks over what actually landed; the verdict goes into the incompatible list. A version proven
+`incompatible` is **never** installed, with or without the flag — it stays in the second group.
+
+Only an npm source can have an update: a `file:`, `link:` or `github:` plugin is reinstalled from its
+own specifier and has no registry version to compare with, so it is always in the third group. The
+version chosen is pinned (`name@version`), so what the preview shows and what gets installed cannot
+disagree — including when the installed copy itself is unconfirmed.
+
+By default the new version is installed **over the current copy**, which is what `dsh` itself does
+and what keeps a failed install from leaving the plugin missing. `--detach-first` restores the older
+`remove`-then-`install` sequence; in the menu it is the second question of item 8.
 
 ## Reports for scripts and agents
 
@@ -287,14 +364,15 @@ and the shadow and wire entries carry the same `confidence` field.
 **One line of counts.** `--summary` replaces the report with a single line:
 
 ```
-5 plugins checked, 2 incompatible, 1 unknown, 1 wire-dead, 0 handler-failures
+5 plugins checked, 2 incompatible, 1 unknown, 0 verified, 1 wire-dead, 0 handler-failures
 ```
 
-With `--json` the same numbers are one object — `total`, `incompatible`, `unknown`, `wire_dead`,
-`handler_failures` and `exit_code` (the code the command returns). `incompatible` counts the
-plugins with a definite negative status, `unknown` the ones no verdict was produced for, and
-`wire_dead` and `handler_failures` the plugins with a dead call and with a route handler that fails
-on its first call.
+With `--json` the same numbers are one object — `total`, `incompatible`, `unknown`, `verified`,
+`wire_dead`, `handler_failures` and `exit_code` (the code the command returns). `incompatible`
+counts the plugins with a definite negative status, `unknown` the ones no verdict was produced for,
+`verified` the ones the runtime probe has proven on the installed core, and `wire_dead` and
+`handler_failures` the plugins with a dead call and with a route handler that fails on its first
+call. `status` and `verify` omit `verified`: they report on the probe itself, not on a target core.
 
 **Comparing two runs.** `verify --diff PATH` reads a result saved earlier (`state/verified-<profile>.json`,
 or any file with the same shape) and prints only what differs:
@@ -317,12 +395,14 @@ on one side only as added or removed. With `--json` it is
 
 ## Output: colors, groups, wrapping
 
-* **Colors.** On a terminal the statuses are colored (`ok` green, `NO` red, `??` yellow), headings
+* **Colors.** On a terminal the statuses are colored (`ok` green, `NO` red, `??` yellow, `✓` bold
+  green), headings
   are cyan, paths and commands are highlighted, notes are dim. Piped output stays plain, so logs
   and `--json` are unaffected. The mode is chosen by `--color`, the `DSH_UPGRADE_COLOR` environment
   variable or `NO_COLOR`.
 * **Groups.** Every matrix is grouped instead of being one flat dump: the compatibility table by
-  status (incompatible → unconfirmed → compatible), `status` by plugin source (npm / local / git),
+  status (incompatible → unconfirmed → compatible → verified), `status` by plugin source
+  (npm / local / git),
   `plan` by outcome (safe → unconfirmed present → incompatible present), and the incompatible-list
   viewer by status.
 * **Long cells are wrapped, never truncated.** The `reason` column is never cut: the column widths
@@ -402,12 +482,67 @@ Plus two caveats that matter in practice:
   clean"). It is a gap in the declarations, not a failure. Such plugins can be installed with
   `--install-unknown` — the post-check after installation re-runs the checks against the actual code
   and filters out the bad ones. To find out whether they actually WORK, ask the runtime instead of
-  the declarations: see [Do they actually work?](#do-they-actually-work).
+  the declarations: see [Do they actually work?](#do-they-actually-work). When the runtime has
+  answered, the plugin stops being reported as unconfirmed — see
+  [Verified](#verified--checked-and-seen-working).
 * **Empirical verdict.** If the check runs against the same core on which the plugin is already
   installed, and the code is clean, the plugin counts as good, even if the declarations require a
   newer version. Thus a plugin may declare `^0.1.2-rc.1` (a newer core than the one installed)
   yet work perfectly on `0.1.1-rc.2`; breaking a working installation because of a strict
   declaration is not acceptable.
+
+### Verified — checked and seen working
+
+The declaration checks say what a manifest promises, and the runtime probe says what the code does.
+When both agree on the core being judged, the tool says so: the plugin is **verified** (`✓`, the
+strongest status) instead of merely `ok` or `??`.
+
+A plugin is graded `verified` only when all of this holds:
+
+* the target IS the installed core — a runtime verdict is evidence about one core version, and the
+  cache is keyed by a fingerprint that covers the core and every installed copy, so a verdict taken
+  before either changed is not reused;
+* the cached probe saw the server entry import, `apply()` run without throwing, and every route
+  handler it registered answer its first call;
+* the declaration and code checks found nothing, and an undeclared plugin's code checks actually ran
+  and came back clean — "nothing declared" on its own is not evidence;
+* the client half does not draw into a row the profile switched off, and none of the plugin's calls
+  addresses an endpoint this core does not serve.
+
+Nothing is executed to produce the grade: it reads the cache a previous `verify` left behind. So
+`check` on the installed core reports `verified` for the plugins `verify` has proven, and reports
+them as `compatible` or `unconfirmed` again if there is no fresh verdict — run `verify` (menu item
+14) first when the grade matters. A proven incompatibility is never hidden by a working
+installation, and an empirical verdict keeps the reason that explains which declaration it overrode.
+
+### Available updates
+
+Versions published on the registry are queried with `--update`, and always by `plugins` — choosing an
+update means comparing versions, so `plugins` consults the registry whatever the flags are. Only an
+npm source can have one: a plugin installed from a local artifact has no registry version to look up.
+With the column filled in, the `version` cell of the matrix is marked so that a plugin with a newer
+release is visible at a glance, and the colour says what the tool would actually do:
+
+| mark | meaning |
+|---|---|
+| `↑` green/bold | the newest published version evaluates **compatible** — this is the version an update installs by itself |
+| `↑` yellow | a newer version exists but was **not confirmed** (`??` or incompatible) — `plugins` holds it back and installs it only under `--install-unknown` (never one proven incompatible) |
+
+The `latest` column carries the version itself, coloured the same way. A legend under the table names
+the exact specifiers in both groups, so the installable ones do not have to be reconstructed from two
+columns.
+
+The marker is deliberately *not* a promise. It is drawn from the same verdict the update logic uses
+(`best_compatible_version`), so a green `↑` is a version `plugins` would really install, and a yellow
+one is a version it installs only when asked — the distinction matters because a newer release can
+raise its own minimum core. Without `--update` the column stays empty for lack of data (not because
+every plugin is current), and the report says so explicitly rather than letting an empty column read
+as "everything is up to date". Marking is decoration only: `--color never`, a pipe or a log file still
+get the `↑` and the `latest` value; only the colours are dropped.
+
+Unrelated to the marker: a local plugin may share its name with a **different** package published on
+npm. That twin is reported in the verbose block (`npm has X under this name`), never as an update —
+the local artifact is what is installed, and it is installed by specifier.
 
 ## Do they actually work?
 
@@ -776,8 +911,9 @@ python3 dsh_upgrade.py inspect file:~/build/my-plugin.tgz --since 0.1.1-rc.2   #
 * Exit codes match `check`: `0` — nothing proven incompatible, `2` — incompatible, `1` — the path
   or the manifest could not be read. With `--json` stdout is a SINGLE JSON document (the analysis
   progress goes to stderr), so it can be piped straight into a script.
-* Because the artifact has not run on any core, the **empirical** promotion never applies here: a
-  strict declaration stays "unconfirmed" until the plugin is actually installed and working.
+* Because the artifact has not run on any core, neither the **empirical** promotion nor the
+  **verified** grade applies here: a strict declaration stays "unconfirmed" until the plugin is
+  actually installed and working.
 
 ## Safety
 
@@ -793,10 +929,17 @@ python3 dsh_upgrade.py inspect file:~/build/my-plugin.tgz --since 0.1.1-rc.2   #
 * **Exact versions only.** On reinstallation an npm package is installed as `name@version`, not by
   the recorded range: a range like `^0.3.16` would pull the newest version, which may require a
   different core (a real case: the newest release of a plugin may raise its own minimum core).
-* **Upgrades only.** `--update` raises the version only if the new one passes the check; there are
-  no downgrades.
+* **Upgrades only.** A version is raised only if it passes the check, or — under
+  `plugins --install-unknown` — if it is the newer version the reader explicitly opted into and is
+  re-judged afterwards by the post-check; there are no downgrades.
+* **A narrowed operation touches only its selection.** `--only` checks every name against the profile
+  before anything is changed, so a typo aborts the run instead of quietly doing nothing. `detach --only`
+  still snapshots the whole profile, and the incompatible list is rebuilt from the post-check over the
+  whole profile, so a partial run cannot leave either of them describing only what it touched.
 * **Post-check.** After installation the code checks are run again — now against the files that
-  are actually installed; the ones that fail land in the list (and are detached with `--prune-failed`).
+  are actually installed. The ones that fail land in the list; `attach --prune-failed` removes them
+  right away, while `plugins` never removes a plugin it installed — an unconfirmed version opted into
+  with `--install-unknown` that then fails the post-check stays in the profile and is named in the list.
 
 ## State files
 
@@ -815,6 +958,8 @@ configuration directory, not here — see "Settings are remembered" above.
 
 Example of a list: `incompatible-0.1.5-rc.2.md` — a table with the status (`NO` — proven
 incompatibility, `??` — unconfirmed), the reason, the requirement and the commands for what to do next.
+Only plugins that are neither compatible nor verified appear there, so a fresh runtime verdict can
+empty the list.
 
 ## Environment variables
 
@@ -831,7 +976,7 @@ incompatibility, `??` — unconfirmed), the reason, the requirement and the comm
 ## Checks and tests
 
 ```bash
-python3 -m unittest discover -s tests -v          # 381 tests: semver, declarations, scans, registrations, local builds, core layouts, menu, settings, checkouts, verification, route-handler calls, the effective loader tree, shadowed surfaces, wire contracts, pasteable hints, completion, tables, target
+python3 -m unittest discover -s tests -v          # 535 tests: semver, declarations, scans, registrations, local builds, core layouts, menu, settings, checkouts, verification, route-handler calls, the effective loader tree, shadowed surfaces, wire contracts, pasteable hints, completion, tables, target, update selection, verified grades
 python3 dsh_upgrade.py check --core 0.1.5-rc.2   # exit code 2 if there are incompatible plugins
 ```
 
@@ -868,6 +1013,13 @@ and `DSH_CHECKOUTS_ROOT` at a directory holding the core checkouts.
   route handler throws a `ReferenceError` on its first call, and — with `--live` — that the surfaces it
   claims are really served by the running host. The final word on "did the row apply" is DSH's own boot
   log, the GUI's Settings → Plugins, and `--live`.
+* **`verified` is a claim about the probe, on one core.** It is granted from the CACHED verdict of a
+  `verify` run, and only when the target is the installed core — the same cache is what turns
+  `compatible` and clean undeclared plugins into `verified`. So the grade says "the probe proved this
+  copy on the core it ran against, and no other check objected", never "it will work". Change a plugin,
+  the core or the probe schema and the fingerprint drops the verdict: the plugin falls back to its
+  declaration status until `verify` runs again. A plugin the probe could only grade as a lead
+  (`handler?`, `shadowed?`) is not verified either.
 * **Calling a route handler is not a real request, and only a `ReferenceError` is a verdict.** The
   handler sees `GET`, an empty body, no authentication, stub services and a synthetic response, so "the
   first call did not throw" is not proof that it works. The recorded call is graded accordingly: a

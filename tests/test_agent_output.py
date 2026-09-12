@@ -519,7 +519,8 @@ class CheckSummaryTest(unittest.TestCase):
             code, text = self._run(self._namespace(), tmp)
         payload = json.loads(text)
         self.assertEqual(payload, {"total": 4, "incompatible": 2, "unknown": 1,
-                                   "wire_dead": 0, "handler_failures": 0, "exit_code": 2})
+                                   "wire_dead": 0, "handler_failures": 0, "exit_code": 2,
+                                   "verified": 0})
         self.assertEqual(code, 2)
 
     def test_without_the_flag_the_report_document_is_printed_instead(self):

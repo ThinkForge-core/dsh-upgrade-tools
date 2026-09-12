@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Update the plugins only, leaving the core alone.
+"""Update the plugins that have a newer version, leaving the core alone.
 
 Wrapper around `dsh_upgrade.py plugins`; every argument is passed through.
 Run it with DSH switched off. Example: python3 scripts/plugins.py --help
