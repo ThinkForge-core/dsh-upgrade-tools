@@ -3,8 +3,8 @@
 Tools for upgrading the DeepSeek Harness core and the plugins of a profile.
 
 [Repository](https://github.com/ThinkForge-core/dsh-upgrade-tools) · MIT ·
-targets **DSH `0.1.5-rc.2`**; functionality on another
-version of DeepSeek Harness is not guaranteed.
+runs against **the DSH core you have installed** — no core version is pinned
+(see [Compatibility](#compatibility)).
 
 Runs as **plain Python 3** (standard library only, no npm and no Node). The read-only actions
 (`status`, `core-versions`, `plan`, `check`, `inspect`) work against a **running** harness too —
@@ -27,6 +27,37 @@ incompatible ones aside into a list":
 check ──► snapshot ──► detach all plugins ──► core upgrade ──► install compatible ones
                                                              └─► the rest into the list
 ```
+
+## Compatibility
+
+**No core version is pinned.** Every command reads the core that is actually installed — found
+through the `dsh` CLI on `PATH`, or named by `DSH_INSTALL_DIR` — and takes its facts from that core's
+own bytes: the package manifests, the generated TYPERT faces that declare its wire endpoints, its
+effective loader tree. Nothing assumes a release, so the installed core is always the baseline and
+upgrading *from* an old one is the ordinary case rather than a special mode.
+
+Verified end-to-end against three releases of the `0.1.x` line:
+
+| Installed core | Host packages | Client rows | TYPERT faces | Wire endpoints | `status` | `check` |
+|---|---|---|---|---|---|---|
+| `0.1.0-rc.8` | 193 | 43 | 7 | 26 | exit 0 | exit 0 |
+| `0.1.1-rc.2` | 194 | 43 | 7 | 26 | exit 0 | exit 0 |
+| `0.1.5-rc.2` | 237 | 55 | 15 | 84 | exit 0 | exit 0 |
+
+Those numbers differ per release because they are *read* from that release, not assumed. A core whose
+surfaces the tool cannot interpret is reported as such — an empty inventory, a wire check that says it
+was not performed — rather than guessed at.
+
+The installed core is read from either layout the harness can produce: a **global install**, whose
+packages are nested under `<core>/node_modules/@deepseek-ai`, or a **hoisted tree**, where they sit
+beside the core package. Reading only one of the two silently loses part of the inventory — and the
+verdicts that depend on it.
+
+One version-dependent input is worth knowing about: when no checkout of the target core is available,
+the inline-purity rule (check 6) falls back to a built-in classification copied from `0.1.5-rc.2`.
+That set is deliberately broad, so a missing entry relaxes the check instead of inventing an
+incompatibility; naming the target with `--core` and letting the tool fetch its checkout replaces the
+built-in set with the target's own rule.
 
 ## Quick start
 
@@ -692,7 +723,7 @@ incompatibility, `??` — unconfirmed), the reason, the requirement and the comm
 ## Checks and tests
 
 ```bash
-python3 -m unittest discover -s tests -v          # 375 tests: semver, declarations, scans, registrations, local builds, menu, settings, checkouts, verification, route-handler calls, the effective loader tree, shadowed surfaces, wire contracts, pasteable hints, completion, tables, target
+python3 -m unittest discover -s tests -v          # 381 tests: semver, declarations, scans, registrations, local builds, core layouts, menu, settings, checkouts, verification, route-handler calls, the effective loader tree, shadowed surfaces, wire contracts, pasteable hints, completion, tables, target
 python3 dsh_upgrade.py check --core 0.1.5-rc.2   # exit code 2 if there are incompatible plugins
 ```
 
@@ -770,7 +801,7 @@ and `DSH_CHECKOUTS_ROOT` at a directory holding the core checkouts.
 dsh_upgrade.py             # CLI with all subcommands + opening the menu without arguments
 scripts/                   # wrappers for each subcommand
 dshupgrade/
-├── paths.py               # DSH home, profile, core directory, checkout locations, state
+├── paths.py               # DSH home, profile, core directory (nested or hoisted), checkout locations, state
 ├── config.py              # the settings file: options remembered between runs
 ├── invocation.py          # the exact command that reproduces a report (pasteable hints)
 ├── completion.py          # terminal-grade path input (Tab completion, unescaping)
@@ -793,8 +824,8 @@ dshupgrade/
 └── report.py              # width-aware tables and grouped verdicts
 tests/                     # unittest (semver, locals, menu, settings, checkouts,
                            #   completion, report tables, target, registrations,
-                           #   declaration integrity, inline purity, verification,
-                           #   wire contracts, hints and the loader tree)
+                           #   declaration integrity, inline purity, core layouts,
+                           #   verification, wire contracts, hints and the loader tree)
 state/                     # snapshots, lists, verification verdicts, cache
 ```
 
