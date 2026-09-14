@@ -214,7 +214,7 @@ beats the saved setting (see [Environment variables](#environment-variables)).
 | `attach [--from F] [--only NAME…] [--update] [--install-unknown] [--prune-failed] [--yes]` | Installation from a snapshot: installs the compatible ones, the rest go into the list. `--only` restores just the named plugins from the snapshot. |
 | `recheck [--file F] [--install] [--install-unknown] [--yes]` | Recheck the incompatible list and install the ones that became compatible; with `--install-unknown` also the unconfirmed ones (post-checked). |
 | `plugins [--only NAME…] [--install-unknown] [--detach-first] [--yes]` | Update the plugins that have a newer version, on the current core — all of them, or with `--only` just the named ones. Nothing else in the profile is touched: a plugin with nothing newer is not detached and not reinstalled (see [Only the plugins with an update](#only-the-plugins-with-an-update)). `--install-unknown` also installs a newer version that is not confirmed for this core; `--detach-first` removes each plugin before installing its new version. |
-| `pipeline [--core V] [--update] [--install-unknown] [--run-core-upgrade] [--yes]` | Full pipeline from check to post-check. `--install-unknown` is **off** by default: only proven-compatible plugins are installed, everything else goes into the incompatible list. |
+| `pipeline [--core V] [--update] [--install-unknown] [--run-core-upgrade] [--yes]` | Full pipeline from check to post-check. `--install-unknown` is **off** by default: only proven-compatible plugins are installed, everything else goes into the incompatible list. On Termux the core upgrade is followed by the patch layer before the plugins are installed — see [On Termux](#on-termux). |
 
 Wrapper scripts for each step live in `scripts/` (`menu.py`, `status.py`, `verify.py`, `plan.py`,
 `check.py`, `artifact.py` for `inspect`, `detach.py`, `attach.py`, `recheck.py`, `pipeline.py`,
@@ -225,7 +225,8 @@ import in the tool.
 Common flags: `--profile` (default `web`), `--core`, `--offline`, `--no-clone`,
 `--json`, `--verbose`, `--color auto|always|never`, `--state-dir`,
 `--checkouts temp|keep|DIR`, `--prune-checkouts` (delete the temporary checkouts and continue — or
-exit, when no command was given). They can be given both before
+exit, when no command was given), `--termux` / `--no-termux` and `--termux-dir DIR` (see
+[On Termux](#on-termux)). They can be given both before
 and after the subcommand — the defaults are applied after parsing, because argparse would
 otherwise let a subparser's defaults overwrite a flag given before the subcommand.
 
@@ -304,6 +305,61 @@ disagree — including when the installed copy itself is unconfirmed.
 By default the new version is installed **over the current copy**, which is what `dsh` itself does
 and what keeps a failed install from leaving the plugin missing. `--detach-first` restores the older
 `remove`-then-`install` sequence; in the menu it is the second question of item 8.
+
+## On Termux
+
+On Termux/Android the core upgrade is **not finished** when `npm i -g` returns. That
+command restores the pristine upstream tree, and the pristine tree does not run
+there: Android's sepolicy denies `link(2)` in app-private storage (which is how the
+`write`/`edit` tools publish a file, and how sessions and attachments are saved),
+Bionic has no `flock(2)`, `sharp` ships no android-arm64 binary, and several
+`process.platform === "linux"` checks never match `"android"`.
+
+Those corrections live in a separate layer — the
+[`deepseek-harness-termux`](https://github.com/ThinkForge-core/deepseek-harness-termux)
+fork — whose anchor-based patcher is re-applied after every core install. The tool
+knows about it:
+
+* **The layer is found, or fetched.** It is discovered in the usual places (and by
+  `$DSH_TERMUX_DIR`); when there is none, the fork is cloned to
+  `$DSH_HOME/termux-layer`. `--termux-dir DIR` names one explicitly — and a directory
+  that is *not* a layer is reported as such rather than quietly replaced by another
+  checkout.
+* **The target is capped to the version the layer validates.** The patcher matches
+  upstream by exact anchors, so a core past the release it was validated against
+  cannot be patched. `install.sh` records that release as `VALIDATED_DSH_VERSION`, and
+  the automatic target uses it instead of the newest published version (with a note
+  saying so). The cap never moves backwards: a layer behind the installed core is
+  reported, not turned into a downgrade.
+* **The order is corrected at the seam the pipeline already had.** Without
+  `--run-core-upgrade` the tool prints the npm command and then the steps that follow
+  it — `fix-dsh-runtime.sh` *before* the `attach`:
+
+  ```
+  === Step 3. Core upgrade ===
+    currently installed: 0.1.1-rc.2
+    command: npm i -g @deepseek-ai/dsh@0.1.5-rc.2
+    termux layer: /data/…/deepseek-harness-termux
+    Run this command yourself (it needs access outside the workspace), then:
+      1. bash /data/…/deepseek-harness-termux/fix-dsh-runtime.sh
+      2. …/dsh_upgrade.py attach --yes
+  ```
+
+  With `--run-core-upgrade` the same happens by itself: npm, then the patcher, then
+  the plugins. The order is not cosmetic — the post-check installs and judges plugins
+  against the core they run on, and a plugin judged against an unpatched core is
+  judged against a core that cannot write a file on this platform.
+* **The natives are checked, and rebuilt only if they are gone.** The patcher
+  recompiles nothing; a version bump can replace `node-pty`/`koffi` with sources that
+  carry no built addon. They are probed afterwards (a `node -e require(...)` from the
+  core directory) and the layer's installer rebuilds them only when the probe really
+  fails — several minutes, but only then.
+
+`status` prints the layer and the version it validates (and `--json` carries it as
+`core.termux`); the menu's settings screen shows it as item **11**. None of this
+depends on the platform being detected correctly by accident: `--termux` forces the
+correction on, `--no-termux` turns it off for a deliberately pristine core, and on
+anything that is not Termux the whole subject is absent from the output.
 
 ## Reports for scripts and agents
 

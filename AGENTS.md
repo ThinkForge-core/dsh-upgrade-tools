@@ -37,6 +37,40 @@ to see what exists.
 | `--install-unknown` | `attach`, `recheck`, `pipeline`, `plugins` | also install/reinstall the unconfirmed ones, with a post-install code check |
 | `--detach-first` | `plugins` | remove each plugin before installing its new version; by default the new version is installed over the current copy |
 | `--dry-run` / `--yes` | destructive | print the plan and change nothing / confirm the operation |
+| `--termux` / `--no-termux` | all | force the Termux/Android correction on or off; the default detects Termux |
+| `--termux-dir DIR` | all | where the Termux patch layer lives; the default discovers it, then clones the fork |
+
+## The Termux correction
+
+On Termux the core upgrade is not complete when `npm i -g` returns: that command
+restores the **pristine upstream tree**, which does not run on Android (sepolicy
+denies `link(2)`, Bionic has no `flock(2)`, `sharp` has no android-arm64 build).
+The Android corrections live in a separate layer — the
+`deepseek-harness-termux` fork — whose anchor-based patcher is re-applied after
+every core install.
+
+`dsh-upgrade-tools` handles this itself, so nothing here is a step an agent has
+to remember:
+
+* the layer is discovered (or the fork is cloned to `$DSH_HOME/termux-layer`) and
+  reported in `status` (`core.termux` in `--json`) and in the menu settings;
+* the automatic target is capped to the version the layer validates
+  (`VALIDATED_DSH_VERSION` in its `install.sh`), because the patcher matches
+  upstream by exact anchors and a core past that version cannot be patched. The
+  cap never moves backwards;
+* the pipeline's core-upgrade seam prints — and with `--run-core-upgrade` runs —
+  `fix-dsh-runtime.sh` **between** `npm i -g` and `attach`, which is the correct
+  order: a plugin judged against an unpatched core is judged against a core that
+  cannot write a file on that platform. If the native addons no longer load, the
+  layer's installer rebuilds them.
+
+Consequences for an agent:
+
+* `--run-core-upgrade` on Termux now also patches the core and may take several
+  minutes when the natives have to be rebuilt. That is expected, not a hang.
+* Without a layer the step degrades to a printed instruction plus a warning —
+  never to silence.
+* `--no-termux` is for a deliberate pristine core; do not pass it on Android.
 
 Two flags and one command are easy to misread, and all three decide what you can actually do:
 

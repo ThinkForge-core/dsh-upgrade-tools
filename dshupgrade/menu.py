@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import completion, config as config_mod, effects as effects_mod, invocation as invocation_mod
-from . import paths, registry, snapshot, style, wire as wire_mod
+from . import paths, registry, snapshot, style, termux as termux_mod, wire as wire_mod
 from .paths import core_install_dir, core_version, profile_dir
 from .profile import read_profile
 from .report import GLYPH, grouped_table
@@ -58,6 +58,12 @@ class Settings:
     state_dir: str | None = None
     #: Where version checkouts live: ``temp`` (default), ``keep`` or a directory.
     checkouts: str = paths.TEMP
+    #: The Termux correction: None detects Termux, True/False force it on or off.
+    #: Auto is the default because the correction is only ever wanted where the
+    #: platform needs it, and a menu option nobody has to find is the point.
+    termux: bool | None = None
+    #: Where the Termux patch layer lives; None discovers it, then clones the fork.
+    termux_dir: str | None = None
     #: Options that came from a command-line flag: they are never written to the
     #: settings file, so a one-off flag cannot silently become permanent.
     pinned: frozenset = frozenset()
@@ -66,6 +72,8 @@ class Settings:
     _auto_target: str | None = field(default=None, compare=False, repr=False)
     _auto_offline: bool | None = field(default=None, compare=False, repr=False)
     _auto_fallback: bool = field(default=False, compare=False, repr=False)
+    #: Why the automatic target is not the newest published version (the Termux cap).
+    _auto_note: str | None = field(default=None, compare=False, repr=False)
 
     # ------------------------------------------------------------- persistence
     def as_config(self) -> dict:
@@ -80,6 +88,8 @@ class Settings:
             "color": self.color,
             "state_dir": self.state_dir,
             "checkouts": self.checkouts,
+            "termux": self.termux,
+            "termux_dir": self.termux_dir,
         }
 
     def apply_config(self, values: dict) -> None:
@@ -113,6 +123,21 @@ class Settings:
             return f"kept in {paths.dsh_home() / 'checkouts'}"
         return f"kept in {self.checkouts}"
 
+    def termux_label(self) -> str:
+        """A human sentence for the Termux correction, including the layer it found.
+
+        The layer path is part of the sentence because it is the thing that decides
+        whether a core upgrade can be corrected at all: with none on disk the npm
+        step leaves a pristine tree, and the settings screen is where that is worth
+        seeing before a pipeline runs rather than after.
+        """
+        state = {None: "auto", True: "always", False: "never"}[self.termux]
+        found = termux_mod.layer(self.termux_dir)
+        if found is None:
+            return f"{state} — no layer found (a core upgrade would not be corrected)"
+        validated = termux_mod.validated_version(found)
+        return f"{state} — {found}" + (f" · validates {validated}" if validated else "")
+
     def auto_target(self, *, refresh: bool = False) -> str:
         """The version the automatic target resolves to: the NEWEST published one.
 
@@ -121,16 +146,24 @@ class Settings:
         when the user actually asks about the target — goes to the network.
 
         When no version can be determined at all (no cache, no network), the
-        installed core is shown instead and marked as a fallback.
+        installed core is shown instead and marked as a fallback. On Termux the
+        answer is capped to the version the patch layer validates, so the header
+        shows the version the commands will really target rather than one whose
+        Android corrections do not exist yet.
         """
         cached = self._auto_target is not None and self._auto_offline == self.offline
         if not refresh and cached:
             return self._auto_target
         resolved = registry.newest_core_version(offline=self.offline or not refresh)
+        resolved, self._auto_note = termux_mod.target_for(self, resolved)
         self._auto_fallback = resolved is None
         self._auto_target = resolved or core_version() or "not found"
         self._auto_offline = self.offline
         return self._auto_target
+
+    def target_note(self) -> str | None:
+        """Why the automatic target is not the newest published version, if it is not."""
+        return self._auto_note
 
     def target_label(self, *, refresh: bool = False) -> str:
         """``auto — 0.1.5-rc.2``, or the version chosen explicitly."""
@@ -339,6 +372,8 @@ class Menu:
             "verbose": settings.verbose,
             "state_dir": settings.state_dir,
             "checkouts": settings.checkouts,
+            "termux": settings.termux,
+            "termux_dir": settings.termux_dir,
             # flags of specific commands
             "update": False,
             "detach_first": False,
@@ -754,6 +789,9 @@ class Menu:
             self.console.write("  Settings (they apply to every menu item):")
             self.console.write(f"   1 profile:           {settings.profile}")
             self.console.write(f"   2 target core:       {settings.target_label()}")
+            if settings.target_note():
+                self.console.write(self.console.paint(
+                    f"                        {settings.target_note()}", "dim"))
             self.console.write(f"   3 offline:           {'yes' if settings.offline else 'no'}"
                                "  (cache only, no network)")
             self.console.write(f"   4 no clone:          {'yes' if settings.no_clone else 'no'}"
@@ -764,7 +802,9 @@ class Menu:
                                f"{settings.state_dir or 'default (state/ of the repository)'}")
             self.console.write(f"   8 checkouts:         {settings.checkouts_label()}")
             self.console.write("   9 remove the temporary checkouts now")
-            self.console.write(f"  10 forget saved settings ({config_mod.config_path()})")
+            self.console.write("  10 forget saved settings "
+                               f"({config_mod.config_path()})")
+            self.console.write(f"  11 termux correction: {settings.termux_label()}")
             self.console.write("   0 back")
             self.console.write(self.console.paint(
                 "  Every change is written to the settings file and applies to later runs; "
@@ -831,6 +871,24 @@ class Menu:
                 settings.apply_config(config_mod.DEFAULTS)
                 paths.set_checkouts_setting(settings.checkouts)
                 style.set_mode(settings.color)
+            elif choice == "11":
+                self.console.write(self.console.paint(
+                    "     auto — correct a core upgrade on Termux, ignore it elsewhere "
+                    "(default)", "dim"))
+                self.console.write(self.console.paint(
+                    "     on / off — force it, whatever the platform is", "dim"))
+                self.console.write(self.console.paint(
+                    "     or a directory holding fix-dsh-runtime.sh (Tab completes, ~ works)",
+                    "dim"))
+                answer = self.console.ask_path(
+                    "  termux layer (auto/on/off/dir, Enter — keep the current one): ")
+                if answer:
+                    lowered = answer.strip().lower()
+                    if lowered in ("auto", "on", "off"):
+                        settings.termux = {"auto": None, "on": True, "off": False}[lowered]
+                    else:
+                        settings.termux_dir = answer
+                    self._persist()
             else:
                 self.console.write("  no such item")
 

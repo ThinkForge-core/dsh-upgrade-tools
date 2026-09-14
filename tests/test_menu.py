@@ -579,8 +579,18 @@ class MenuSettingsPersistenceTest(unittest.TestCase):
         self.assertNotIn("profile", config_mod.load())
 
     def test_switching_back_to_auto_forgets_the_target(self):
-        self.drive("11\n2\n0.1.5-rc.2\n11\n2\n-\n0\n\n0\n")
+        # Item 11 is the termux correction, so it is no longer a free keystroke in
+        # the settings screen: this sequence enters item 2 twice, deliberately.
+        self.drive("11\n2\n0.1.5-rc.2\n2\n-\n0\n\n0\n")
         self.assertNotIn("core", config_mod.load())
+
+    def test_the_termux_layer_can_be_named(self):
+        self.drive("11\n11\n/tmp/termux-layer\n0\n\n0\n")
+        self.assertEqual(config_mod.load()["termux_dir"], "/tmp/termux-layer")
+
+    def test_the_termux_correction_can_be_forced_off(self):
+        self.drive("11\n11\noff\n0\n\n0\n")
+        self.assertIs(config_mod.load()["termux"], False)
 
     def test_forget_removes_the_saved_settings(self):
         self.drive("11\n1\nother\n0\n\n0\n")

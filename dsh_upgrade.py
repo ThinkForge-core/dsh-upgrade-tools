@@ -44,6 +44,7 @@ from dshupgrade import effects as effects_mod  # noqa: E402
 from dshupgrade import invocation as invocation_mod  # noqa: E402
 from dshupgrade import locals as locals_mod  # noqa: E402
 from dshupgrade import paths, registry, report, semver, snapshot, style  # noqa: E402
+from dshupgrade import termux as termux_mod  # noqa: E402
 from dshupgrade import verify as verify_mod  # noqa: E402
 from dshupgrade import wire as wire_mod  # noqa: E402
 from dshupgrade.compat import (  # noqa: E402
@@ -139,8 +140,17 @@ def resolve_target(args) -> str:
         return args.core
     newest = registry.newest_core_version(offline=getattr(args, "offline", False))
     if newest is not None:
-        print(style.dim(f"  auto target: {style.subheading(newest)} — the newest published "
-                        "version (use --core to pick another one)"), file=_log_stream(args))
+        # On Termux the newest published version is not automatically the right
+        # target: the Android corrections are anchored to one release, so a core
+        # past it cannot be patched. The cap is applied here, before anything is
+        # compared against the target, so every command sees the same version.
+        newest, note = termux_mod.target_for(args, newest)
+        if note:
+            print(style.dim(f"  auto target: {style.subheading(newest)} — {note} "
+                            "(use --core to pick another one)"), file=_log_stream(args))
+        else:
+            print(style.dim(f"  auto target: {style.subheading(newest)} — the newest published "
+                            "version (use --core to pick another one)"), file=_log_stream(args))
         return newest
     current = core_version()
     if current:
@@ -800,7 +810,8 @@ def cmd_status(args) -> int:
         return payload
 
     payload = {
-        "core": {"version": current, "installDir": str(install_dir) if install_dir else None},
+        "core": {"version": current, "installDir": str(install_dir) if install_dir else None,
+                 "termux": termux_mod.summary(args)},
         "profile": {"name": profile.name, "dir": str(profile.directory),
                     "bundles": profile.bundles},
         "plugins": [plugin_payload(plugin) for plugin in profile.plugins],
@@ -822,6 +833,16 @@ def cmd_status(args) -> int:
         print(f"  recent versions: {', '.join(v['version'] for v in data['versions'][-6:])}")
     except RuntimeError as error:
         print(report.warning(f"registry unavailable: {error}"))
+
+    # The Termux line is printed only where it changes what a command would do: on
+    # Android a core upgrade without the patch layer produces a tree that does not
+    # run, so "is the layer there, and which version does it validate" is part of the
+    # core's state, not a footnote to the platform.
+    if termux_mod.active(args):
+        print(f"  termux layer: {_path_row(payload['core']['termux']['layer']) if payload['core']['termux']['layer'] else style.warn('not found')}")
+        validated = payload["core"]["termux"]["validated"]
+        if validated:
+            print(f"  layer validates: {style.subheading(validated)}")
 
     print()
     print(style.heading("=== Profile ==="))
@@ -2001,6 +2022,39 @@ def cmd_plugins(args) -> int:
     return 0
 
 
+def _realign_termux(layer_dir, target: str) -> None:
+    """Put the Android corrections back after a core install, natives included.
+
+    The patcher is idempotent and safe on a pristine tree — ``install.sh`` and
+    ``fix-dsh-runtime.sh`` share one anchor-based patcher — so it runs
+    unconditionally rather than first asking whether the core looks patched. It
+    recompiles nothing, though: a version bump can replace ``node-pty``/``koffi``
+    with fresh sources that carry no built addon, and only the layer's full
+    installer builds those. So the natives are probed afterwards and the installer
+    runs only when the probe really fails, never on every upgrade.
+    """
+    print(style.dim("  re-applying the Termux patches…"))
+    code = termux_mod.realign(layer_dir, log=lambda text: print(style.dim(f"    {text}")))
+    if code != 0:
+        print(report.warning(f"  the Termux patcher exited with {code} — the core may be only "
+                             "partly patched; run its install.sh for the detail"))
+    ok, detail = termux_mod.natives_ok()
+    if ok:
+        print(style.good(f"  native addons load (sharp {detail})"))
+        return
+    print(report.warning(f"  native addons do not load: {detail}"))
+    print(style.dim("  rebuilding them with the layer's installer (this takes several minutes)…"))
+    code = termux_mod.rebuild(layer_dir, target, log=lambda text: print(style.dim(f"    {text}")))
+    if code != 0:
+        print(report.warning(f"  the installer exited with {code} — the natives may still be missing"))
+        return
+    ok, detail = termux_mod.natives_ok()
+    if ok:
+        print(style.good(f"  native addons load (sharp {detail})"))
+    else:
+        print(report.warning(f"  native addons still do not load: {detail}"))
+
+
 def cmd_pipeline(args) -> int:
     """The full pipeline: check → snapshot → detach → (core upgrade) → install."""
     profile = load_profile(args)
@@ -2051,6 +2105,36 @@ def cmd_pipeline(args) -> int:
     command = f"npm i -g {DSH_PACKAGE}@{target}"
     print(f"  currently installed: {current or '—'}")
     print(f"  command: {style.command(command)}")
+
+    # On Termux the npm command is only half the upgrade: it restores the pristine
+    # upstream tree, which does not run on Android. The layer puts the corrections
+    # back, and it has to happen BEFORE the plugin installation — a plugin judged
+    # against an unpatched core is judged against a core that cannot write a file
+    # on this platform, so the post-check would blame the plugins for the platform.
+    layer_dir = None
+    if termux_mod.active(args):
+        layer_dir = termux_mod.ensure_layer(
+            getattr(args, "termux_dir", None),
+            clone=not args.offline and not args.no_clone,
+            log=lambda text: print(style.dim(f"  {text}")))
+        if layer_dir is not None:
+            print(f"  termux layer: {_path_row(str(layer_dir))}")
+            validated = termux_mod.validated_version(layer_dir)
+            if validated and validated != target:
+                print(report.warning(
+                    f"  the layer validates {validated}, not {target}: its patcher matches "
+                    "upstream by exact anchors and may refuse this version"))
+        else:
+            if getattr(args, "termux_dir", None):
+                print(report.warning(
+                    f"  {args.termux_dir} is not a Termux layer — expected "
+                    f"{termux_mod.REALIGN_RELATIVE} and {termux_mod.PATCHER_RELATIVE} in it"))
+            else:
+                print(report.warning(
+                    "  Termux detected, but no patch layer is available — npm will leave a "
+                    "pristine tree that does not run here."))
+                print(style.dim(f"  fetch it: git clone {termux_mod.LAYER_REPO}"))
+
     if args.run_core_upgrade:
         print(style.dim("  running (--run-core-upgrade)…"))
         completed = subprocess.run(command, shell=True, check=False)
@@ -2062,11 +2146,24 @@ def cmd_pipeline(args) -> int:
         if after != target:
             print(report.warning(f"expected {target}. The plugin installation will run "
                                  "against the actual version."))
+        if layer_dir is not None:
+            _realign_termux(layer_dir, target)
     else:
         print(style.dim("  Run this command yourself (it needs access outside the workspace), then:"))
-        print("    " + style.command(invocation_mod.command(
-            "attach", "--yes", *(["--update"] if args.update else []),
-            profile=args.profile)))
+        # The layer's steps are inserted between npm and attach, which is the seam
+        # that makes a Termux upgrade correct; without a layer there is nothing to
+        # number and the line reads as it did before this module existed.
+        # The loop variable must not be `step`: that name is the step counter the
+        # `head()` closure above writes through, and shadowing it breaks every later
+        # heading.
+        attach = invocation_mod.command(
+            "attach", "--yes", *(["--update"] if args.update else []), profile=args.profile)
+        words = termux_mod.commands(layer_dir, target)
+        if words:
+            for number, line in enumerate([*words, attach], start=1):
+                print(f"    {number}. " + style.command(line))
+        else:
+            print("    " + style.command(attach))
 
     if args.skip_attach:
         head("Done (installation deferred)")
@@ -2161,6 +2258,17 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--prune-checkouts", action="store_true", default=argparse.SUPPRESS,
                         help="delete the temporary checkouts and continue (or exit when no "
                              "command was given)")
+    # The Termux correction is on by default wherever it is needed, so both switches
+    # exist only to override the detection: `--no-termux` for a deliberate pristine
+    # core, `--termux` to exercise the layer where the detection cannot see it.
+    common.add_argument("--termux", dest="termux", action="store_true", default=argparse.SUPPRESS,
+                        help="force the Termux/Android correction on (default: detected)")
+    common.add_argument("--no-termux", dest="termux", action="store_false",
+                        default=argparse.SUPPRESS,
+                        help="do not apply the Termux patch layer after a core upgrade")
+    common.add_argument("--termux-dir", default=argparse.SUPPRESS, metavar="DIR",
+                        help="where the Termux patch layer lives (default: discovered, then "
+                             "cloned from the fork)")
 
     parser = argparse.ArgumentParser(
         prog="dsh-upgrade",

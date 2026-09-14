@@ -36,6 +36,11 @@ DEFAULTS = {
     "color": None,
     "state_dir": None,
     "checkouts": "temp",
+    #: The Termux correction. ``None`` means auto-detect (the layer is used on
+    #: Termux and ignored elsewhere), ``True``/``False`` force it on or off.
+    "termux": None,
+    #: Where the Termux patch layer lives; None lets it be discovered.
+    "termux_dir": None,
 }
 
 #: Keys that hold a truth value (toggled in the settings screen).
@@ -58,13 +63,17 @@ def _clean(name: str, value):
     A settings file is user-editable, so every value is validated on the way in:
     a typo must degrade to the built-in default, never crash a run.
     """
-    if name in ("profile", "core", "state_dir", "checkouts"):
+    if name in ("profile", "core", "state_dir", "checkouts", "termux_dir"):
         if value is None:
             return None
         text = str(value).strip()
         return text or None
     if name == "color":
         return value if isinstance(value, str) and value in style.MODES else None
+    # The Termux correction is tri-state on purpose: None is "detect it", and only a
+    # real boolean may override the detection.
+    if name == "termux":
+        return value if isinstance(value, bool) else None
     if name in FLAGS:
         return value if isinstance(value, bool) else None
     return None
